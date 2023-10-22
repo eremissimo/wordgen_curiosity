@@ -55,8 +55,6 @@ def get_alphabet(words: pd.Series) -> str:
     chars = set()
     for i, word in enumerate(words):
         chars.update(word)
-        if '\x96' in word:
-            print(i, word)
     alphabet = "".join(sorted(chars))
     return alphabet
 
