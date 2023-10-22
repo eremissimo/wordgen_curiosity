@@ -35,6 +35,7 @@ def _deal_with_duplicates(df: pd.DataFrame, target_pos: str):
     # TODO: for other target_pos there must be more involved procedure, maybe I'll do it but not now
     assert target_pos == "v. t.", f"target_pos == {target_pos} is not yet supported"
     df.drop_duplicates("word", keep="last", inplace=True)
+    df.reset_index(drop=True, inplace=True)
 
 
 def _add_train_test_split_column(df: pd.DataFrame, target_pos: str, train_test_proportion: List | Tuple):
@@ -112,6 +113,7 @@ class CharTokenizer:
         # > end sequence (word)
         assert not set(alphabet).intersection("*<>")
         self.alphabet = "".join(["*<>", alphabet])
+        self.n_tokens = len(self.alphabet)
         self._encoder = {char: i for i, char in enumerate(self.alphabet)}
         self._decoder = self.alphabet
         self._convert_fn = convert_fn
