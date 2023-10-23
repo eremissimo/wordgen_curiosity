@@ -17,6 +17,15 @@ class WordStatus(Enum):
     TARGWORD_TRAIN = 2
     TARGWORD_TEST = 3
 
+    def __lt__(self, other):
+        return self.value < other.value
+
+    def __gt__(self, other):
+        return self.value > other.value
+
+    def __str__(self):
+        return self.name
+
 
 def load_dictionary(path: Pathlike, lower=True, filter_missing=False) -> pd.DataFrame:
     # keep_default_na = False because we don't want to interpret valid words like 'None', 'NaN' etc. as missing values
@@ -47,9 +56,9 @@ def _add_train_test_split_column(df: pd.DataFrame, target_pos: str, train_test_p
     targ_idxs_train = targ_idxs_all[shuffle_idxs[:n_targ_train]]
     targ_idxs_test = targ_idxs_all[shuffle_idxs[n_targ_train:]]
 
-    df["train/test"] = np.zeros(len(df), dtype=np.uint8)
-    df.loc[targ_idxs_train, "train/test"] = 1
-    df.loc[targ_idxs_test, "train/test"] = 2
+    df["train/test"] = WordStatus.WORD
+    df.loc[targ_idxs_train, "train/test"] = WordStatus.TARGWORD_TRAIN
+    df.loc[targ_idxs_test, "train/test"] = WordStatus.TARGWORD_TEST
 
 
 def get_alphabet(words: pd.Series) -> str:
@@ -78,33 +87,6 @@ handle_int_batches = partial(_handle_batches, single_instance_check_fn=lambda x:
 # handle_int_batches = partial(_handle_batches, single_instance_check_fn=lambda x: isinstance(x[0], int))
 
 
-class WordChecker:
-    """A class that classifies an input word as a word, a non-word or a word from the target part of speech."""
-    def __init__(self, dictionary: pd.DataFrame, target_pos: str):
-        self._word_series = dictionary["word"]
-        self._pos = dictionary["pos"].to_numpy()
-        self._target_train_test = dictionary["train/test"].to_numpy()
-        self._target_pos = target_pos
-        self._n = len(dictionary)
-
-    @handle_str_batches
-    def check(self, word) -> WordStatus:
-        # using built-in pandas binary search via searchsorted
-        idx = self._word_series.searchsorted(word)
-        word_q = self._word_series.iloc[idx]
-        if idx == self._n or word_q != word:
-            return WordStatus.NONWORD
-        # words can belong to multiple parts of speech, so we have to check next entries
-        while word_q == word:
-            if self._target_train_test[idx] == 1:
-                return WordStatus.TARGWORD_TRAIN
-            if self._target_train_test[idx] == 2:
-                return WordStatus.TARGWORD_TEST
-            idx += 1
-            word_q = self._word_series.iloc[idx]
-        return WordStatus.WORD
-
-
 class CharTokenizer:
     def __init__(self, alphabet: str, convert_fn: Optional[Callable] = None):
         # additional characters:
@@ -130,15 +112,70 @@ class CharTokenizer:
         return "".join(self._decoder[i] for i in idxs)
 
 
+class CharTrieNode:
+    __slots__ = ["children", "is_full_word", "value"]
+
+    def __init__(self, value: Optional[WordStatus] = None):
+        self.children: Dict[str, CharTrieNode] = {}
+        self.is_full_word = False
+        self.value = value
+
+
+class CharTrie:
+    """A word and prefixes checker. This is a character level trie implemented via nested dicts essentially.
+    This data structure will be used later in RL fine-tuning to produce rewards for generated prefixes and full words.
+
+    CharTrie.check is meant to identify if a given prefix is a prefix of a non-word, word, target train or
+    test p.o.s. word. Combined with modify_value_fn = max it sets a priority for types, e.g. ['b', 'bu', 'buy'] are
+    considered as target word prefixes tor target p.o.s = 'v. t.'. """
+    def __init__(self, modify_value_fn=max):
+        self.root = CharTrieNode()
+        self.node_count = 0
+        self._modify_value_fn = modify_value_fn     # this takes the current node value, other value and produces a
+                                                    # new value for the current node
+
+    def insert(self, word: str, value: WordStatus):
+        current_node = self.root
+        for char in word:
+            if char not in current_node.children:
+                self.node_count += 1
+                current_node.children[char] = CharTrieNode(value)
+            elif self._modify_value_fn is not None:
+                current_node.value = value if current_node.value is None \
+                    else self._modify_value_fn(current_node.value, value)
+            current_node = current_node.children[char]
+        current_node.is_full_word = True
+
+    def from_iterable(self, words: Iterable[str], values: Iterable[WordStatus]):
+        """Building the trie from iterables"""
+        for word, value in zip(words, values):
+            self.insert(word, value)
+
+    @handle_str_batches
+    def check(self, word) -> Tuple[WordStatus, bool]:
+        """The main prefix search function"""
+        current_node = self.root
+        for char in word:
+            if char not in current_node.children:
+                return WordStatus.NONWORD, False
+            current_node = current_node.children[char]
+        return current_node.value, current_node.is_full_word
+
+    def reset(self):
+        self.root = CharTrieNode()
+        self.node_count = 0
+
+
 def create_words_data(path: Pathlike, rl_target: str = "v. t.", train_test_proportion=(1, 2)):
     # rl_target is the set of words defined by 'pos' column (part of speech) that is used for RL fine-tuning
     dictionary = load_dictionary(path, lower=True, filter_missing=False)
     _deal_with_duplicates(dictionary, rl_target)
     _add_train_test_split_column(dictionary, rl_target, train_test_proportion)
     alphabet = get_alphabet(dictionary["word"])
-    is_word = WordChecker(dictionary, rl_target)
-    pretrain_words_series = dictionary.loc[dictionary["train/test"] < 2, "word"]
-    return pretrain_words_series, is_word, alphabet
+    word_checker = CharTrie(modify_value_fn=max)
+    word_checker.from_iterable(dictionary["word"], dictionary["train/test"])
+    pretrain_words_series = dictionary.loc[dictionary["train/test"] < WordStatus.TARGWORD_TEST, "word"]
+    return pretrain_words_series, word_checker, alphabet
 
 
 class WordsDataset(TensorDataset):
@@ -147,17 +184,17 @@ class WordsDataset(TensorDataset):
         # adding 'begin sequence', 'end sequence' and 'padding' characters
         data = word_series.map(lambda string: "".join(["<", string, ">", "*"*(n - len(string))]))
         data = tokenizer.encode(data)   # pd.Series of tuples of ints
-        data = torch.tensor(data, dtype=torch.uint8)
+        data = torch.tensor(data, dtype=torch.long)
         inputs = data[:, :-1]
         targets = data[:, 1:]
         super().__init__(inputs, targets)
 
 
-def get_data(data_cfg: Dict) -> Tuple[DataLoader, CharTokenizer, WordChecker]:
+def get_data(data_cfg: Dict) -> Tuple[DataLoader, CharTokenizer, CharTrie]:
     """Outputs pretrain dataloaer, tokenizer (for decoding), word checker (for rl finetuning)"""
     print("Dataset preparation ...", end="")
-    pretrain_words_series, is_word, alphabet = create_words_data(data_cfg["path"], data_cfg["target_pos"],
-                                                                 data_cfg["train_test_proportion"])
+    pretrain_words_series, word_checker, alphabet = create_words_data(data_cfg["path"], data_cfg["target_pos"],
+                                                                      data_cfg["train_test_proportion"])
     print(".", end="")
     tokenizer = CharTokenizer(alphabet)
     pretrain_dataset = WordsDataset(pretrain_words_series, tokenizer)
@@ -167,7 +204,7 @@ def get_data(data_cfg: Dict) -> Tuple[DataLoader, CharTokenizer, WordChecker]:
                                      pin_memory_device="cuda")
     print("Done!")
     print("Using alphabet: ", alphabet)
-    return pretrain_dataloader, tokenizer, is_word
+    return pretrain_dataloader, tokenizer, word_checker
 
 
 if __name__ == "__main__":
