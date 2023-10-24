@@ -134,6 +134,14 @@ class CuriosityRewardGRU(CuriosityReward):
         super().__init__(teacher, student, lr=lr, temperature=temperature, scale=scale)
 
 
+def save_checkpoint(model, path, optimizer=None):
+    torch.save(model.cpu().state_dict(), path)
+
+
+def load_checkpoint(model, path):
+    model.load_state_dict(torch.load(path))
+
+
 if __name__ == "__main__":
     from data import get_data
 
@@ -148,7 +156,7 @@ if __name__ == "__main__":
                  "dim_feedforward": 20,
                  "dropout": 0.1,
                  "num_layers": 2}
-    dataloader, tokenizer, _ = get_data(data_cfg)
+    dataloader, _, tokenizer, _ = get_data(data_cfg)
     model = CharTransformer(tokenizer.n_tokens, model_cfg)
     inp, targ = next(iter(dataloader))
     out = model(inp)
