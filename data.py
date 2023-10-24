@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import pandas as pd
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, random_split
 from pathlib import Path
 from enum import Enum
 from typing import List, Union, Tuple, Dict, Iterable, Callable, Type, Optional
@@ -78,7 +78,7 @@ def _handle_batches(fcn_single: Callable, single_instance_check_fn: Callable):
             return fcn_single(self, input)
         # batched
         batch_type = type(input)
-        return batch_type(fcn_single(self, w) for w in input)
+        return batch_type(fcn_single(self, w) for w in input)       # TODO: np.array breaks this in handle_int_batches
     return wrapper
 
 
@@ -190,21 +190,24 @@ class WordsDataset(TensorDataset):
         super().__init__(inputs, targets)
 
 
-def get_data(data_cfg: Dict) -> Tuple[DataLoader, CharTokenizer, CharTrie]:
+def get_data(data_cfg: Dict) -> Tuple[DataLoader, DataLoader, CharTokenizer, CharTrie]:
     """Outputs pretrain dataloaer, tokenizer (for decoding), word checker (for rl finetuning)"""
     print("Dataset preparation ...", end="")
     pretrain_words_series, word_checker, alphabet = create_words_data(data_cfg["path"], data_cfg["target_pos"],
                                                                       data_cfg["train_test_proportion"])
     print(".", end="")
     tokenizer = CharTokenizer(alphabet)
-    pretrain_dataset = WordsDataset(pretrain_words_series, tokenizer)
+    pretrain_data, pretrain_val_data = random_split(WordsDataset(pretrain_words_series, tokenizer), lengths=[0.9, 0.1])
     print(". ", end="")
-    pretrain_dataloader = DataLoader(pretrain_dataset, batch_size=data_cfg["batch_size"], shuffle=True,
+    pretrain_dataloader = DataLoader(pretrain_data, batch_size=data_cfg["batch_size"], shuffle=True,
                                      num_workers=data_cfg["num_workers"], pin_memory=True, drop_last=False,
                                      pin_memory_device="cuda")
+    pretrain_val_dataloader = DataLoader(pretrain_val_data, batch_size=data_cfg["batch_size"], shuffle=True,
+                                         num_workers=data_cfg["num_workers"], pin_memory=True, drop_last=False,
+                                         pin_memory_device="cuda")
     print("Done!")
     print("Using alphabet: ", alphabet)
-    return pretrain_dataloader, tokenizer, word_checker
+    return pretrain_dataloader, pretrain_val_dataloader, tokenizer, word_checker
 
 
 if __name__ == "__main__":
@@ -213,7 +216,8 @@ if __name__ == "__main__":
            "train_test_proportion": (1, 2),
            "batch_size": 4,
            "num_workers": 0}
-    dataloader, _, checker = get_data(cfg)
+    dataloader, _, _, checker = get_data(cfg)
     print(next(iter(dataloader)))
-    print(checker.check(['aaaa', 'alienate', 'worm', 'sacrilegious', 'run', 'beat', 'write', 'lol', 'cheetah']))
+    print(checker.check(['a', 'aa', 'aaa', 'aaaa', 'alienate', 'worm',
+                         'sacrilegious', 'run', 'beat', 'write', 'lol', 'cheetah']))
     print("woah!")
