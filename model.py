@@ -32,7 +32,8 @@ class CharTransformer(nn.Module):
         x = self.decoder_head(x)
         return x
 
-    def _positions(self, x):
+    @staticmethod
+    def _positions(x):
         # for pos embedding
         # x.shape = [batch, seq]
         return torch.arange(x.shape[1], device=x.device, requires_grad=False)
@@ -98,7 +99,7 @@ class DummyGRUModel(nn.Module):
 
 
 class CuriosityReward(nn.Module):
-    """A distillation based curiosity. The agent gets more reward for getting to unknown state
+    """A distillation based curiosity. The agent gets more reward for getting to unfamiliar state
     (i.e. when there is a discrepancy between teacher and student model outputs)"""
     def __init__(self, teacher: nn.Module, student: nn.Module, lr: float = 1e-3,
                  temperature: float | Iterable[float] = 1., scale: float = 1.):
@@ -123,6 +124,14 @@ class CuriosityReward(nn.Module):
         distill_losses.mean().backward()
         self._optimizer.step()
         return distill_losses.detach() * self.scale
+
+    def calibrate_scale(self, states: torch.Tensor, targ_reward: float):
+        """Setting self.scale so that the output curiosity reward is approximately equal targ_reward"""
+        with torch.no_grad():
+            targets = ff.softmax(self._teacher(states) * self._t_temp, dim=-1)
+            inputs = ff.softmax(self._student(states) * self._s_temp, dim=-1)
+        loss = ff.mse_loss(inputs, targets).item()
+        self.scale = (targ_reward/loss)
 
 
 class CuriosityRewardGRU(CuriosityReward):
@@ -175,8 +184,9 @@ if __name__ == "__main__":
     print("Curiosity")
     states = inp
     curiosity = CuriosityRewardGRU(tokenizer.n_tokens, scale=1000., temperature=(20., 1.))
+    curiosity.calibrate_scale(states, 1.)
     print("surprised: ", curiosity(states))
-    for i in range(100):
+    for _ in range(100):
         curiosity(states)
     print("bored: ", curiosity(states))
 
