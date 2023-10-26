@@ -4,7 +4,7 @@ import pandas as pd
 from torch.utils.data import TensorDataset, DataLoader, random_split
 from pathlib import Path
 from enum import Enum
-from typing import List, Union, Tuple, Dict, Iterable, Callable, Type, Optional
+from typing import List, Union, Tuple, Dict, Iterable, Callable, Optional
 from functools import wraps, partial
 
 
@@ -14,8 +14,8 @@ Pathlike = Union[Path, str]
 class WordStatus(Enum):
     NONWORD = 0
     WORD = 1
-    TARGWORD_TRAIN = 2
-    TARGWORD_TEST = 3
+    TARGWORD_TEST = 2
+    TARGWORD_TRAIN = 3
 
     def __lt__(self, other):
         return self.value < other.value
@@ -72,18 +72,19 @@ def get_alphabet(words: pd.Series) -> str:
 def _handle_batches(fcn_single: Callable, single_instance_check_fn: Callable):
     """A template for decorators that handle batched input."""
     @wraps(fcn_single)
-    def wrapper(self, input):
-        if single_instance_check_fn(input):
+    def wrapper(self, inpt):
+        if single_instance_check_fn(inpt):
             # single
-            return fcn_single(self, input)
+            return fcn_single(self, inpt)
         # batched
-        batch_type = type(input)
-        return batch_type(fcn_single(self, w) for w in input)       # TODO: np.array breaks this in handle_int_batches
+        batch_type = type(inpt)
+        return batch_type([fcn_single(self, w) for w in inpt])
     return wrapper
 
 
 handle_str_batches = partial(_handle_batches, single_instance_check_fn=lambda x: isinstance(x, str))
 handle_int_batches = partial(_handle_batches, single_instance_check_fn=lambda x: isinstance(next(iter(x)), int))
+handle_array_batches = partial(_handle_batches, single_instance_check_fn=lambda x: x.ndim == 1)
 # handle_int_batches = partial(_handle_batches, single_instance_check_fn=lambda x: isinstance(x[0], int))
 
 
@@ -115,8 +116,8 @@ class CharTokenizer:
 class CharTrieNode:
     __slots__ = ["children", "is_full_word", "value"]
 
-    def __init__(self, value: Optional[WordStatus] = None):
-        self.children: Dict[str, CharTrieNode] = {}
+    def __init__(self, value=None):
+        self.children = {}
         self.is_full_word = False
         self.value = value
 
@@ -161,45 +162,121 @@ class CharTrie:
             current_node = current_node.children[char]
         return current_node.value, current_node.is_full_word
 
+    @handle_str_batches
+    def word_values(self, word) -> List[WordStatus]:
+        current_node = self.root
+        out = [WordStatus.NONWORD]*len(word)
+        for i, char in enumerate(word):
+            if char not in current_node.children:
+                return out
+            current_node = current_node.children[char]
+            out[i] = current_node.value
+        return out
+
     def reset(self):
         self.root = CharTrieNode()
         self.node_count = 0
 
 
-def create_words_data(path: Pathlike, rl_target: str = "v. t.", train_test_proportion=(1, 2)):
-    # rl_target is the set of words defined by 'pos' column (part of speech) that is used for RL fine-tuning
-    dictionary = load_dictionary(path, lower=True, filter_missing=False)
-    _deal_with_duplicates(dictionary, rl_target)
-    _add_train_test_split_column(dictionary, rl_target, train_test_proportion)
-    alphabet = get_alphabet(dictionary["word"])
-    word_checker = CharTrie(modify_value_fn=max)
-    word_checker.from_iterable(dictionary["word"], dictionary["train/test"])
-    pretrain_words_series = dictionary.loc[dictionary["train/test"] < WordStatus.TARGWORD_TEST, "word"]
-    return pretrain_words_series, word_checker, alphabet
+ArrayLike = Union[np.ndarray, torch.Tensor]
 
 
-class WordsDataset(TensorDataset):
-    def __init__(self, word_series: pd.Series, tokenizer: CharTokenizer):
-        n = word_series.map(len).max()
-        # adding 'begin sequence', 'end sequence' and 'padding' characters
-        data = word_series.map(lambda string: "".join(["<", string, ">", "*"*(n - len(string))]))
-        data = tokenizer.encode(data)   # pd.Series of tuples of ints
-        data = torch.tensor(data, dtype=torch.long)
-        inputs = data[:, :-1]
-        targets = data[:, 1:]
-        super().__init__(inputs, targets)
+class TokenTrie:
+    def __init__(self, modify_value_fn=max, padding_idx=0):
+        self.root = CharTrieNode()
+        self.node_count = 0
+        self.padding_idx = padding_idx
+        self._modify_value_fn = modify_value_fn  # this takes the current node value, other value and produces a
+        # new value for the current node
+
+    def insert(self, tokenized_word: Iterable[int], value: int):
+        # assuming tokenized_word is consist of the chain of token idxs followed by some amount of padding idxs
+        if next(iter(tokenized_word)) == self.padding_idx:
+            return
+        current_node = self.root
+        for idx in tokenized_word:
+            if idx == self.padding_idx:
+                break
+            if idx not in current_node.children:
+                self.node_count += 1
+                current_node.children[idx] = CharTrieNode(value)
+            elif self._modify_value_fn is not None:
+                current_node.value = value if current_node.value is None \
+                    else self._modify_value_fn(current_node.value, value)
+            current_node = current_node.children[idx]
+        current_node.is_full_word = True
+
+    def from_iterable(self, tokenized_words: Iterable[Iterable[int]], values: Iterable[int]):
+        """Building the trie from iterables"""
+        for word, value in zip(tokenized_words, values):
+            self.insert(word, value)
+
+    @handle_array_batches
+    def check(self, tokenized_word: ArrayLike) -> Tuple[int, bool]:
+        """Prefix search method"""
+        if tokenized_word[0] == self.padding_idx:
+            return 0, False
+        current_node = self.root
+        for idx in tokenized_word:
+            idx = int(idx)
+            if idx == self.padding_idx:
+                break
+            if idx not in current_node.children:
+                return 0, False
+            current_node = current_node.children[idx]
+        return current_node.value, current_node.is_full_word
+
+    @handle_array_batches
+    def word_values(self, tokenized_word: ArrayLike) -> List[int]:
+        current_node = self.root
+        out = [0] * len(tokenized_word)
+        if tokenized_word[0] != self.padding_idx:
+            for i, idx in enumerate(tokenized_word):
+                idx = int(idx)
+                if idx == self.padding_idx:
+                    break
+                if idx not in current_node.children:
+                    return out
+                current_node = current_node.children[idx]
+                out[i] = current_node.value
+        return out
+
+    def reset(self):
+        self.root = CharTrieNode()
+        self.node_count = 0
 
 
-def get_data(data_cfg: Dict) -> Tuple[DataLoader, DataLoader, CharTokenizer, CharTrie]:
+def get_data(data_cfg: Dict) -> Tuple[DataLoader, DataLoader, CharTokenizer, TokenTrie, CharTrie]:
     """Outputs pretrain dataloaer, tokenizer (for decoding), word checker (for rl finetuning)"""
     print("Dataset preparation ...", end="")
-    pretrain_words_series, word_checker, alphabet = create_words_data(data_cfg["path"], data_cfg["target_pos"],
-                                                                      data_cfg["train_test_proportion"])
-    print(".", end="")
+
+    dictionary = load_dictionary(data_cfg["path"], lower=True, filter_missing=False)
+    _deal_with_duplicates(dictionary, data_cfg["target_pos"])
+    _add_train_test_split_column(dictionary, data_cfg["target_pos"], data_cfg["train_test_proportion"])
+    alphabet = get_alphabet(dictionary["word"])
     tokenizer = CharTokenizer(alphabet)
-    pretrain_data, pretrain_val_data = random_split(WordsDataset(pretrain_words_series, tokenizer), lengths=[0.9, 0.1])
+    print(".", end="")
+    # this word checker is built over chars and is being used at evaluation step (if any)
+    eval_word_checker = CharTrie(modify_value_fn=max)
+    eval_word_checker.from_iterable(dictionary["word"], dictionary["train/test"])
+    print(".", end="")
+    # adding 'begin sequence', 'end sequence' and 'padding' characters
+    n = dictionary["word"].map(len).max()
+    dictionary["word"] = dictionary["word"].map(lambda string: "".join(["<", string, ">", "*"*(n - len(string))]))
+    dictionary["word"] = tokenizer.encode(dictionary["word"])  # pd.Series of tuples of ints
+    print(".", end="")
+    # this word checker is built over tokens (idxs) and is used to create rewards at rl training step
+    rl_reward_word_checker = TokenTrie(modify_value_fn=max, padding_idx=0)
+    rl_reward_word_checker.from_iterable(dictionary["word"], dictionary["train/test"].map(lambda ws: ws.value))
+    print(".", end="")
+    # pretrain dataset
+    pretrain_dataset = dictionary.loc[dictionary["train/test"] != WordStatus.TARGWORD_TEST, "word"]
+    pretrain_dataset = torch.tensor(pretrain_dataset, dtype=torch.long)
+    pretrain_dataset = TensorDataset(pretrain_dataset[:, :-1], pretrain_dataset[:, 1:])
+    pretrain_tr_data, pretrain_val_data = random_split(pretrain_dataset, lengths=[0.9, 0.1])
     print(". ", end="")
-    pretrain_dataloader = DataLoader(pretrain_data, batch_size=data_cfg["batch_size"], shuffle=True,
+    # dataloaders
+    pretrain_dataloader = DataLoader(pretrain_tr_data, batch_size=data_cfg["batch_size"], shuffle=True,
                                      num_workers=data_cfg["num_workers"], pin_memory=True, drop_last=False,
                                      pin_memory_device="cuda")
     pretrain_val_dataloader = DataLoader(pretrain_val_data, batch_size=data_cfg["batch_size"], shuffle=True,
@@ -207,7 +284,7 @@ def get_data(data_cfg: Dict) -> Tuple[DataLoader, DataLoader, CharTokenizer, Cha
                                          pin_memory_device="cuda")
     print("Done!")
     print("Using alphabet: ", alphabet)
-    return pretrain_dataloader, pretrain_val_dataloader, tokenizer, word_checker
+    return pretrain_dataloader, pretrain_val_dataloader, tokenizer, rl_reward_word_checker, eval_word_checker
 
 
 if __name__ == "__main__":
@@ -216,8 +293,11 @@ if __name__ == "__main__":
            "train_test_proportion": (1, 2),
            "batch_size": 4,
            "num_workers": 0}
-    dataloader, _, _, checker = get_data(cfg)
-    print(next(iter(dataloader)))
+    dataloader, _, tok, tok_checker, checker = get_data(cfg)
+    inp, targ = next(iter(dataloader))
     print(checker.check(['a', 'aa', 'aaa', 'aaaa', 'alienate', 'worm',
                          'sacrilegious', 'run', 'beat', 'write', 'lol', 'cheetah']))
+    print(checker.word_values("wednesdayyy"))
+    print(tok_checker.word_values(inp))
+
     print("woah!")
