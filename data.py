@@ -178,14 +178,12 @@ class CharTrie:
         self.node_count = 0
 
 
-ArrayLike = Union[np.ndarray, torch.Tensor]
-
-
 class TokenTrie:
-    def __init__(self, modify_value_fn=max, padding_idx=0):
+    def __init__(self, modify_value_fn=max, padding_idx=0, output_pad_idx=-1):
         self.root = CharTrieNode()
         self.node_count = 0
         self.padding_idx = padding_idx
+        self.out_pad_idx = output_pad_idx
         self._modify_value_fn = modify_value_fn  # this takes the current node value, other value and produces a
         # new value for the current node
 
@@ -212,7 +210,7 @@ class TokenTrie:
             self.insert(word, value)
 
     @handle_array_batches
-    def check(self, tokenized_word: ArrayLike) -> Tuple[int, bool]:
+    def check(self, tokenized_word) -> Tuple[int, bool]:
         """Prefix search method"""
         if tokenized_word[0] == self.padding_idx:
             return 0, False
@@ -226,20 +224,25 @@ class TokenTrie:
             current_node = current_node.children[idx]
         return current_node.value, current_node.is_full_word
 
-    @handle_array_batches
-    def word_values(self, tokenized_word: ArrayLike) -> List[int]:
-        current_node = self.root
-        out = [0] * len(tokenized_word)
-        if tokenized_word[0] != self.padding_idx:
-            for i, idx in enumerate(tokenized_word):
-                idx = int(idx)
+    def word_values(self, tokenized_words: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # *1 part is for inter-compatibility between torch.Tensor and np.ndarray
+        out = torch.where(tokenized_words == self.padding_idx, self.out_pad_idx, 0)
+        is_full_word = torch.zeros((tokenized_words.shape[0],), dtype=torch.bool)
+        for i in range(tokenized_words.shape[0]):
+            current_node = self.root
+            nonword = False
+            for j in range(tokenized_words.shape[1]):
+                idx = int(tokenized_words[i, j])
                 if idx == self.padding_idx:
                     break
                 if idx not in current_node.children:
-                    return out
+                    nonword = True
+                    break
                 current_node = current_node.children[idx]
-                out[i] = current_node.value
-        return out
+                out[i, j] = current_node.value
+            if not nonword:
+                is_full_word[i] = current_node.is_full_word
+        return out, is_full_word
 
     def reset(self):
         self.root = CharTrieNode()
@@ -298,6 +301,9 @@ if __name__ == "__main__":
     print(checker.check(['a', 'aa', 'aaa', 'aaaa', 'alienate', 'worm',
                          'sacrilegious', 'run', 'beat', 'write', 'lol', 'cheetah']))
     print(checker.word_values("wednesdayyy"))
-    print(tok_checker.word_values(inp))
+    vals, is_full = tok_checker.word_values(inp)
+    print(inp)
+    print(vals)
+    print(is_full)
 
     print("woah!")
