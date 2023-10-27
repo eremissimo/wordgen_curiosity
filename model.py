@@ -133,6 +133,10 @@ class CuriosityReward(nn.Module):
         loss = ff.mse_loss(inputs, targets).item()
         self.scale = (targ_reward/loss)
 
+    @property
+    def device(self):
+        return next(self._teacher.parameters()).device
+
 
 class CuriosityRewardGRU(CuriosityReward):
     def __init__(self, n_token: int, lr: float = 1e-3,
@@ -143,8 +147,39 @@ class CuriosityRewardGRU(CuriosityReward):
         super().__init__(teacher, student, lr=lr, temperature=temperature, scale=scale)
 
 
+class WordReward:
+    """Assigning reward when a generated word is present in the dictionary. Using TokenTrie for prefix search."""
+    def __init__(self, token_trie, status_reward_mapping):
+        self._token_trie = token_trie
+        padding_reward = 0.0
+        _remapping_values = [padding_reward] + [status_reward_mapping[k] for k in
+                                                   ["nonword_char", "word_char", "test_word_char", "train_word_char"]]
+        self._reward_mapping_values = torch.tensor(_remapping_values, dtype=torch.get_default_dtype())
+        self._full_word_reward = status_reward_mapping["full_word"]
+
+    def __call__(self, token_words: torch.Tensor) -> torch.Tensor:
+        device = token_words.device
+        token_words = token_words.cpu()
+        values, is_full_word = self._token_trie.word_values(token_words)
+        filled_pad_mask = self._fill_holes_in_paddings(values == -1)
+        values = torch.where(filled_pad_mask, -1, values)
+        values = self._reward_mapping_values[values+1]
+        values = values.flip(dims=(1,)).cumsum(dim=1).flip(dims=(1,))     # Q(s,a) calculation as reverse cumsum
+        values += (~filled_pad_mask)*float(self._full_word_reward)        # taking care of final reward at the end of the
+                                                                          # episode (word)
+        return values.to(device)
+
+    @staticmethod
+    def _fill_holes_in_paddings(mask):
+        # [[0, 0, 1, 0, 1, 0, 0, 1, 1]] -> [[0, 0, 1, 1, 1, 1, 1, 1, 1]]
+        return torch.arange(mask.shape[1], dtype=torch.short).unsqueeze(0) >= mask.short().argmax(dim=1, keepdim=True)
+
+
 def save_checkpoint(model, path, optimizer=None):
-    torch.save(model.cpu().state_dict(), path)
+    device = model.device
+    model.cpu()
+    torch.save(model.state_dict(), path)
+    model.to(device)
 
 
 def load_checkpoint(model, path):
@@ -165,7 +200,14 @@ if __name__ == "__main__":
                  "dim_feedforward": 20,
                  "dropout": 0.1,
                  "num_layers": 2}
-    dataloader, _, tokenizer, _ = get_data(data_cfg)
+    rl_remap = {
+            "nonword_char": -1.0,
+            "word_char": 0.0,
+            "test_word_char": 0.0,
+            "train_word_char": 1.0,
+            "full_word": 35.0
+        }
+    dataloader, _, tokenizer, rl_trie, _ = get_data(data_cfg)
     model = CharTransformer(tokenizer.n_tokens, model_cfg)
     inp, targ = next(iter(dataloader))
     out = model(inp)
@@ -189,5 +231,11 @@ if __name__ == "__main__":
     for _ in range(100):
         curiosity(states)
     print("bored: ", curiosity(states))
+
+    print("\n\n *********** \n\n")
+    print("WordReward")
+    rewards = WordReward(rl_trie, rl_remap)
+    print(rewards(inp))
+
 
     print("woah!")
