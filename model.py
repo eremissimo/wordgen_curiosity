@@ -25,22 +25,12 @@ class CharTransformer(nn.Module):
 
     def forward(self, x):
         pad_mask = (x == 0)
-        x = self.content_embd(x) + self.positional_embd(self._positions(x))     # [batch, seq, d_model]
-        x = self.decoder(x, mask=self._generate_square_subsequent_mask(x.shape[1], x.device),
+        x = self.content_embd(x) + self.positional_embd(positions(x))     # [batch, seq, d_model]
+        x = self.decoder(x, mask=generate_square_subsequent_mask(x.shape[1], x.device),
                          src_key_padding_mask=pad_mask,
                          is_causal=True)
         x = self.decoder_head(x)
         return x
-
-    @staticmethod
-    def _positions(x):
-        # for pos embedding
-        # x.shape = [batch, seq]
-        return torch.arange(x.shape[1], device=x.device, requires_grad=False)
-
-    @staticmethod
-    def _generate_square_subsequent_mask(size, device):
-        return torch.triu(torch.ones((size, size), dtype=torch.bool, device=device), diagonal=1)
 
     @property
     def device(self):
@@ -74,28 +64,41 @@ class CharTransformer(nn.Module):
         return output
 
 
-class DummyGRUModel(nn.Module):
+def positions(x):
+    # for pos embedding
+    # x.shape = [batch, seq]
+    return torch.arange(x.shape[1], device=x.device, requires_grad=False)
+
+
+def generate_square_subsequent_mask(size, device):
+    return torch.triu(torch.ones((size, size), dtype=torch.bool, device=device), diagonal=1)
+
+
+class DummyTransformerEncoder(nn.Module):
     """A module for 'teacher' and 'student' models in curiosity class."""
-    def __init__(self, n_token: int, input_size: int, output_size: int, hidden_size: int, num_layers: int):
+    def __init__(self, n_token: int, d_model: int, n_output: int, n_head: int = 4, num_layers: int = 3):
         super().__init__()
-        self.legs = nn.Embedding(n_token, input_size, padding_idx=0)
-        self.body = nn.GRU(input_size, hidden_size, num_layers=num_layers, batch_first=True)
-        self.head = nn.Linear(hidden_size, output_size)
-        self.h0 = nn.Parameter(torch.randn((num_layers, hidden_size)), requires_grad=True)
+        max_len = 40
+        self.content_embd = nn.Embedding(n_token, d_model, padding_idx=0)
+        self.positional_embd = nn.Embedding(max_len, d_model)
+        layer = nn.TransformerEncoderLayer(d_model,
+                                           n_head,
+                                           dim_feedforward=4*d_model,
+                                           dropout=0.0,
+                                           activation=ff.relu,
+                                           batch_first=True,
+                                           norm_first=False)    # [batch, seq, feat]
+        self.decoder = nn.TransformerEncoder(layer, num_layers, norm=None)
+        self.decoder_head = nn.Linear(d_model, n_output)
 
     def forward(self, x):
-        # assuming x is a LongTensor of token indices of shape [batch, seq]
-        x = self.legs(x)
-        x, _ = self.body(x, self._batched_h0(x.ndim, x.shape[0]))
-        # x = einops.rearrange(x, "nlayers ... hidden -> ... (nlayers hidden)")   # [batch, feat] or [feat]
-        x = self.head(x)
+        pad_mask = (x == 0)
+        x = self.content_embd(x) + self.positional_embd(positions(x))     # [batch, seq, d_model]
+        x = self.decoder(x, mask=generate_square_subsequent_mask(x.shape[1], x.device),
+                         src_key_padding_mask=pad_mask,
+                         is_causal=True)
+        x = self.decoder_head(x)
         return x
-
-    def _batched_h0(self, nd: int, nbatch: int):
-        if nd == 3:
-            # batched input
-            return einops.repeat(self.h0, "nlayers hidden -> nlayers nbatch hidden", nbatch=nbatch)
-        return self.h0
 
 
 class CuriosityReward(nn.Module):
@@ -118,12 +121,13 @@ class CuriosityReward(nn.Module):
         with torch.no_grad():
             targets = ff.softmax(self._teacher(states) * self._t_temp, dim=-1)
         self._optimizer.zero_grad()
-        inputs = ff.softmax(self._student(states) * self._s_temp, dim=-1)
+        inputs = self._student(states) * self._s_temp
         reduce_dims = tuple(range(int(targets.ndim > 2)+1, targets.ndim))    # (0,) for unbatched and (1,...,n) for batched
-        distill_losses = ff.mse_loss(inputs, targets, reduction="none").mean(dim=reduce_dims)
-        distill_losses.mean().backward()
+        distill_loss = ff.cross_entropy(inputs.transpose(-2, -1), targets.transpose(-2, -1))
+        distill_metric = ff.mse_loss(inputs.softmax(-1), targets, reduction="none").mean(dim=reduce_dims)
+        distill_loss.backward()
         self._optimizer.step()
-        return distill_losses.detach() * self.scale
+        return distill_metric.detach() * self.scale
 
     def calibrate_scale(self, states: torch.Tensor, targ_reward: float):
         """Setting self.scale so that the output curiosity reward is approximately equal targ_reward"""
@@ -138,12 +142,13 @@ class CuriosityReward(nn.Module):
         return next(self._teacher.parameters()).device
 
 
-class CuriosityRewardGRU(CuriosityReward):
+class CuriosityRewardTransformer(CuriosityReward):
     def __init__(self, n_token: int, lr: float = 1e-3,
                  temperature: float | Iterable[float] = 1., scale: float = 1.):
         out_size = 40
-        teacher = DummyGRUModel(n_token, 6, out_size, 25, 3)
-        student = DummyGRUModel(n_token, 6, out_size, 25, 3)
+        d_model = 8
+        teacher = DummyTransformerEncoder(n_token, d_model, out_size, 4, 3)
+        student = DummyTransformerEncoder(n_token, d_model, out_size, 4, 3)
         super().__init__(teacher, student, lr=lr, temperature=temperature, scale=scale)
 
 
@@ -227,7 +232,7 @@ if __name__ == "__main__":
     print("\n\n *********** \n\n")
     print("Curiosity")
     states = inp
-    curiosity = CuriosityRewardGRU(tokenizer.n_tokens, scale=1000., temperature=(20., 1.))
+    curiosity = CuriosityRewardTransformer(tokenizer.n_tokens, scale=1000., lr=1e-2, temperature=(20., 1.))
     curiosity.calibrate_scale(states, 1.)
     print("surprised: ", curiosity(states))
     for _ in range(100):
