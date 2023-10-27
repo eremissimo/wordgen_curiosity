@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as ff
 import torch.optim as optim
-import einops
 from torch.distributions import Categorical
 from typing import Iterable, Optional
 
@@ -49,17 +48,31 @@ class CharTransformer(nn.Module):
         tokens = logits.argmax(dim=-1)
         return tokens
 
-    def generate(self, batch_size: int, n: Optional[int] = None):
-        self.eval()
+    def generate_sample(self, batch_size: int, n: Optional[int] = None):
         if n is None:
             n = self.max_word_len
         elif n > self.max_word_len:
             raise ValueError(f"Cannot generate more than {self.max_word_len=} tokens")
         device = self.device
         token = torch.ones((batch_size, 1), dtype=torch.long, device=device)   # begin word token
+        log_probs = torch.zeros((batch_size, 1), dtype=torch.float32, device=device, requires_grad=False)
         output = token.clone()
         for i in range(1, n):
-            token, _ = self.predict_sample(output)
+            token, log_prob = self.predict_sample(output)
+            output = torch.cat((output, token), dim=-1)
+            log_probs = torch.cat((log_probs, log_prob), dim=-1)
+        return output, log_probs
+
+    def generate_argmax(self, batch_size: int, n: Optional[int] = None):
+        if n is None:
+            n = self.max_word_len
+        elif n > self.max_word_len:
+            raise ValueError(f"Cannot generate more than {self.max_word_len=} tokens")
+        device = self.device
+        token = torch.ones((batch_size, 1), dtype=torch.long, device=device)  # begin word token
+        output = token.clone()
+        for i in range(1, n):
+            token = self.predict_argmax(output)
             output = torch.cat((output, token), dim=-1)
         return output
 
@@ -152,34 +165,50 @@ class CuriosityRewardTransformer(CuriosityReward):
         super().__init__(teacher, student, lr=lr, temperature=temperature, scale=scale)
 
 
-class WordReward:
+class WordReward(nn.Module):
     """Assigning reward when a generated word is present in the dictionary. Using TokenTrie for prefix search."""
-    def __init__(self, token_trie, status_reward_mapping):
+    def __init__(self, token_trie, status_reward_mapping: dict):
+        super().__init__()
         self._token_trie = token_trie
         padding_reward = 0.0
         _remapping_values = [padding_reward] + [status_reward_mapping[k] for k in
                                                    ["nonword_char", "word_char", "test_word_char", "train_word_char"]]
-        self._reward_mapping_values = torch.tensor(_remapping_values, dtype=torch.get_default_dtype())
+        _reward_mapping_values = torch.tensor(_remapping_values, dtype=torch.float32)
+        self.register_buffer("_reward_mapping_values", _reward_mapping_values)
         self._full_word_reward = status_reward_mapping["full_word"]
 
-    def __call__(self, token_words: torch.Tensor) -> torch.Tensor:
+    def forward(self, token_words: torch.Tensor) -> torch.Tensor:
         maxn = token_words.shape[1]
         device = token_words.device
+        # token trie is cpu-only thing
         token_words = token_words.cpu()
-        values, is_full_word = self._token_trie.word_values(token_words)
+        values, is_full_word = (x.to(device) for x in self._token_trie.word_values(token_words))
+        # all the following computations are performed on device
         filled_pad_mask = self._fill_holes_in_paddings_and_invert(values == -1)
         values = torch.where(filled_pad_mask, values, -1)
         values = self._reward_mapping_values[values+1]
-        values = values @ torch.tril(torch.ones(maxn, maxn))    # Q(s,a) calculation as reverse cumsum
+        # Q(s,a) calculation (reverse cumsum)
+        values = values @ torch.tril(torch.ones((maxn, maxn), device=device, dtype=torch.float32))
         # taking care of the final reward at the end of the word (or episode in the terms of RL)
         full_word_reward = is_full_word * (self._full_word_reward - values[:, 0])
         values += filled_pad_mask * full_word_reward.unsqueeze(1)
-        return values.to(device)
+        return values
 
     @staticmethod
     def _fill_holes_in_paddings_and_invert(mask: torch.Tensor) -> torch.Tensor:
         # [[0, 0, 1, 0, 1, 0, 0, 1, 1]] -> [[1, 1, 0, 0, 0, 0, 0, 0, 0]]
-        return torch.arange(mask.shape[1], dtype=torch.short).unsqueeze(0) < mask.short().argmax(dim=1, keepdim=True)
+        return (torch.arange(mask.shape[1], dtype=torch.short, device=mask.device).unsqueeze(0) <
+                mask.short().argmax(dim=1, keepdim=True))
+
+
+class SumRewards(nn.Module):
+    """Calculates a sum of the individual reward modules' output"""
+    def __init__(self, *reward_modules):
+        super().__init__()
+        self.modules = nn.ModuleList(reward_modules)
+
+    def forward(self, states: torch.Tensor) -> torch.Tensor:
+        return sum(reward(states) for reward in self.modules)
 
 
 def save_checkpoint(model, path, optimizer=None):
@@ -226,7 +255,7 @@ if __name__ == "__main__":
     print("pred_sample: ", pred2[0].shape)
     print("pred_sample_logprobs: ", pred2[1].shape)
 
-    gen = model.generate(10, 20).numpy().tolist()
+    gen = model.generate_argmax(10, 20).numpy().tolist()
     print(tokenizer.decode(gen))
 
     print("\n\n *********** \n\n")
@@ -238,7 +267,7 @@ if __name__ == "__main__":
     for _ in range(100):
         curiosity(states)
     print("bored: ", curiosity(states))
-    states2 = states
+    states2 = states.clone()
     states2[:, 5:] = torch.randint(0, 30, (4, 21))
     print("partly bored: ", curiosity(states2))
 
@@ -246,6 +275,14 @@ if __name__ == "__main__":
     print("WordReward")
     rewards = WordReward(rl_trie, rl_remap)
     print(rewards(inp))
+
+    print("\n\n *********** \n\n")
+    print("REINFORCE")
+    seq, log_probs = model.generate_sample(30, 6)
+    seq_baseline = model.generate_argmax(30, 6)
+    advantage = rewards(seq) - rewards(seq_baseline)
+    print(advantage)
+    pg_loss = (advantage * log_probs).mean()
 
 
     print("woah!")
