@@ -205,10 +205,10 @@ class SumRewards(nn.Module):
     """Calculates a sum of the individual reward modules' output"""
     def __init__(self, *reward_modules):
         super().__init__()
-        self.modules = nn.ModuleList(reward_modules)
+        self.rewards = nn.ModuleList(reward_modules)
 
     def forward(self, states: torch.Tensor) -> torch.Tensor:
-        return sum(reward(states) for reward in self.modules)
+        return sum(reward(states) for reward in self.rewards)
 
 
 def save_checkpoint(model, path, optimizer=None):

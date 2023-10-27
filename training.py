@@ -69,19 +69,17 @@ def rl_train(model, tokenizer, token_trie, config, optimizer=None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     curiosity_reward = CuriosityRewardTransformer(tokenizer.n_tokens)
     word_reward = WordReward(token_trie, rl_cfg["status_reward_mapping"])
-    reward = SumRewards([word_reward, curiosity_reward]).to(device)
+    reward = SumRewards(word_reward, curiosity_reward).to(device)
     model = model.to(device)
     if optimizer is None:
         optimizer = optim.Adam(model.parameters(), lr=rl_cfg["lr"])
     # calibrate curiosity
     batch = model.generate_sample(100)
-    curiosity_reward.calibrate_scale(batch, rl_cfg["initial_curiosity"])      # TODO: check if this works properly
+    curiosity_reward.calibrate_scale(batch[0], rl_cfg["initial_curiosity"])      # TODO: check if this works properly
     for step in range(rl_cfg["steps"]):
         mean_reward, seq = pg_step(model, reward, optimizer, batch_size, self_critic)
         # metrics = calculate_rl_metrics(seq, token_trie)
-        epoch, substep = divmod(step, 100)
-        if substep == 0:
-            print(f"Epoch {epoch}: Mean reward {mean_reward}")
+        print(f"Step {step}: Mean reward {mean_reward}")
 
 
 def pg_step(model, reward, optimizer, batch_size, self_critic=True):
@@ -89,12 +87,12 @@ def pg_step(model, reward, optimizer, batch_size, self_critic=True):
     optimizer.zero_grad()
     seq, log_probs = model.generate_sample(batch_size)
     advantage = reward(seq)
-    mean_rew = advantage.mean()
+    mean_rew = advantage.mean().item()
     if self_critic:
         with torch.no_grad():
             seq_baseline = model.generate_argmax(batch_size)
         advantage -= reward(seq_baseline)
-    pg_loss = (advantage * log_probs).mean()
+    pg_loss = -(advantage * log_probs).mean()
     pg_loss.backward()
     optimizer.step()
     return mean_rew, seq
