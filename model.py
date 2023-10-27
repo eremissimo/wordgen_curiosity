@@ -80,21 +80,21 @@ class DummyGRUModel(nn.Module):
         super().__init__()
         self.legs = nn.Embedding(n_token, input_size, padding_idx=0)
         self.body = nn.GRU(input_size, hidden_size, num_layers=num_layers, batch_first=True)
-        self.head = nn.Linear(num_layers*hidden_size, output_size)
+        self.head = nn.Linear(hidden_size, output_size)
         self.h0 = nn.Parameter(torch.randn((num_layers, hidden_size)), requires_grad=True)
 
     def forward(self, x):
         # assuming x is a LongTensor of token indices of shape [batch, seq]
         x = self.legs(x)
-        _, x = self.body(x, self._batched_h0(x))
-        x = einops.rearrange(x, "nlayers ... hidden -> ... (nlayers hidden)")   # [batch, feat] or [feat]
+        x, _ = self.body(x, self._batched_h0(x.ndim, x.shape[0]))
+        # x = einops.rearrange(x, "nlayers ... hidden -> ... (nlayers hidden)")   # [batch, feat] or [feat]
         x = self.head(x)
         return x
 
-    def _batched_h0(self, x):
-        if x.ndim == 3:
+    def _batched_h0(self, nd: int, nbatch: int):
+        if nd == 3:
             # batched input
-            return einops.repeat(self.h0, "nlayers hidden -> nlayers nbatch hidden", nbatch=x.shape[0])
+            return einops.repeat(self.h0, "nlayers hidden -> nlayers nbatch hidden", nbatch=nbatch)
         return self.h0
 
 
@@ -119,7 +119,7 @@ class CuriosityReward(nn.Module):
             targets = ff.softmax(self._teacher(states) * self._t_temp, dim=-1)
         self._optimizer.zero_grad()
         inputs = ff.softmax(self._student(states) * self._s_temp, dim=-1)
-        reduce_dims = tuple(range(int(targets.ndim > 1), targets.ndim))    # (0,) for unbatched and (1,...,n) for batched
+        reduce_dims = tuple(range(int(targets.ndim > 2)+1, targets.ndim))    # (0,) for unbatched and (1,...,n) for batched
         distill_losses = ff.mse_loss(inputs, targets, reduction="none").mean(dim=reduce_dims)
         distill_losses.mean().backward()
         self._optimizer.step()
@@ -233,6 +233,9 @@ if __name__ == "__main__":
     for _ in range(100):
         curiosity(states)
     print("bored: ", curiosity(states))
+    states2 = states
+    states2[:, 5:] = torch.randint(0, 30, (4, 21))
+    print("partly bored: ", curiosity(states2))
 
     print("\n\n *********** \n\n")
     print("WordReward")
