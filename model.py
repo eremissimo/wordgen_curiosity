@@ -158,21 +158,23 @@ class WordReward:
         self._full_word_reward = status_reward_mapping["full_word"]
 
     def __call__(self, token_words: torch.Tensor) -> torch.Tensor:
+        maxn = token_words.shape[1]
         device = token_words.device
         token_words = token_words.cpu()
         values, is_full_word = self._token_trie.word_values(token_words)
-        filled_pad_mask = self._fill_holes_in_paddings(values == -1)
-        values = torch.where(filled_pad_mask, -1, values)
+        filled_pad_mask = self._fill_holes_in_paddings_and_invert(values == -1)
+        values = torch.where(filled_pad_mask, values, -1)
         values = self._reward_mapping_values[values+1]
-        values = values.flip(dims=(1,)).cumsum(dim=1).flip(dims=(1,))     # Q(s,a) calculation as reverse cumsum
-        values += (~filled_pad_mask)*float(self._full_word_reward)        # taking care of final reward at the end of the
-                                                                          # episode (word)
+        values = values @ torch.tril(torch.ones(maxn, maxn))    # Q(s,a) calculation as reverse cumsum
+        # taking care of the final reward at the end of the word (or episode in the terms of RL)
+        full_word_reward = is_full_word * (self._full_word_reward - values[:, 0])
+        values += filled_pad_mask * full_word_reward.unsqueeze(1)
         return values.to(device)
 
     @staticmethod
-    def _fill_holes_in_paddings(mask):
-        # [[0, 0, 1, 0, 1, 0, 0, 1, 1]] -> [[0, 0, 1, 1, 1, 1, 1, 1, 1]]
-        return torch.arange(mask.shape[1], dtype=torch.short).unsqueeze(0) >= mask.short().argmax(dim=1, keepdim=True)
+    def _fill_holes_in_paddings_and_invert(mask: torch.Tensor) -> torch.Tensor:
+        # [[0, 0, 1, 0, 1, 0, 0, 1, 1]] -> [[1, 1, 0, 0, 0, 0, 0, 0, 0]]
+        return torch.arange(mask.shape[1], dtype=torch.short).unsqueeze(0) < mask.short().argmax(dim=1, keepdim=True)
 
 
 def save_checkpoint(model, path, optimizer=None):
