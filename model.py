@@ -48,6 +48,7 @@ class CharTransformer(nn.Module):
         tokens = logits.argmax(dim=-1)
         return tokens
 
+    # TODO: consider preallocation
     def generate_sample(self, batch_size: int, n: Optional[int] = None):
         if n is None:
             n = self.max_word_len
@@ -132,9 +133,9 @@ class CuriosityReward(nn.Module):
         """Given the state perform a single curiosity reward calculation (distill_loss) with a single backprop step"""
         # assuming state is on the same device as teacher and student models
         with torch.no_grad():
-            targets = ff.softmax(self._teacher(states) * self._t_temp, dim=-1)
+            targets = ff.softmax(self._teacher(states) * self._t_temp + self._get_pad_mask(states), dim=-1)
         self._optimizer.zero_grad()
-        inputs = self._student(states) * self._s_temp
+        inputs = self._student(states) * self._s_temp + self._get_pad_mask(states)
         reduce_dims = tuple(range(int(targets.ndim > 2)+1, targets.ndim))    # (0,) for unbatched and (1,...,n) for batched
         distill_loss = ff.cross_entropy(inputs.transpose(-2, -1), targets.transpose(-2, -1))
         distill_metric = ff.mse_loss(inputs.softmax(-1), targets, reduction="none").mean(dim=reduce_dims)
@@ -145,10 +146,14 @@ class CuriosityReward(nn.Module):
     def calibrate_scale(self, states: torch.Tensor, targ_reward: float):
         """Setting self.scale so that the output curiosity reward is approximately equal targ_reward"""
         with torch.no_grad():
-            targets = ff.softmax(self._teacher(states) * self._t_temp, dim=-1)
-            inputs = ff.softmax(self._student(states) * self._s_temp, dim=-1)
+            targets = ff.softmax(self._teacher(states) * self._t_temp + self._get_pad_mask(states), dim=-1)
+            inputs = ff.softmax(self._student(states) * self._s_temp + self._get_pad_mask(states), dim=-1)
         loss = ff.mse_loss(inputs, targets).item()
         self.scale = (targ_reward/loss)
+
+    @staticmethod
+    def _get_pad_mask(states, pad_idx=0):
+        return torch.where(states == pad_idx, float("-inf"), 0.0)
 
     @property
     def device(self):
@@ -160,8 +165,8 @@ class CuriosityRewardTransformer(CuriosityReward):
                  temperature: float | Iterable[float] = 1., scale: float = 1.):
         out_size = 40
         d_model = 8
-        teacher = DummyTransformerEncoder(n_token, d_model, out_size, 4, 3)
-        student = DummyTransformerEncoder(n_token, d_model, out_size, 4, 3)
+        teacher = DummyTransformerEncoder(n_token, d_model, out_size, 4, 2)
+        student = DummyTransformerEncoder(n_token, d_model, out_size, 4, 2)
         super().__init__(teacher, student, lr=lr, temperature=temperature, scale=scale)
 
 
