@@ -40,7 +40,7 @@ class CharTransformer(nn.Module):
         logits = self.forward(x)[..., -1:, :]   # [batch, 1, n_tokens]
         dist = Categorical(logits=logits)
         tokens = dist.sample()
-        return tokens, dist.log_prob(tokens)
+        return tokens, dist.log_prob(tokens), dist.entropy()
 
     def predict_argmax(self, x):
         # predict in argmax mode for RL baselines (self-critical sequence training)
@@ -48,7 +48,6 @@ class CharTransformer(nn.Module):
         tokens = logits.argmax(dim=-1)
         return tokens
 
-    # TODO: consider preallocation
     def generate_sample(self, batch_size: int, n: Optional[int] = None):
         if n is None:
             n = self.max_word_len
@@ -57,14 +56,18 @@ class CharTransformer(nn.Module):
         device = self.device
         token = torch.ones((batch_size, 1), dtype=torch.long, device=device)   # begin word token
         log_probs = torch.zeros((batch_size, 1), dtype=torch.float32, device=device, requires_grad=False)
+        entropy = log_probs.clone()
         output = token.clone()
         for i in range(1, n):
-            token, log_prob = self.predict_sample(output)
+            token, logp, entr = self.predict_sample(output)
             output = torch.cat((output, token), dim=-1)
-            log_probs = torch.cat((log_probs, log_prob), dim=-1)
-        return output, log_probs
+            log_probs = torch.cat((log_probs, logp), dim=-1)
+            entropy = torch.cat((entropy, entr), dim=-1)
+        return output, log_probs, entropy
 
+    @torch.no_grad()
     def generate_argmax(self, batch_size: int, n: Optional[int] = None):
+        # this method is not used for training (unlike generate_sample) hence the no_grad deco
         if n is None:
             n = self.max_word_len
         elif n > self.max_word_len:
@@ -76,6 +79,15 @@ class CharTransformer(nn.Module):
             token = self.predict_argmax(output)
             output = torch.cat((output, token), dim=-1)
         return output
+
+    def freeze_n_layers(self, n: int):
+        self.content_embd.requires_grad_(False)
+        self.positional_embd.requires_grad_(False)
+        for layer in self.decoder.layers[:n]:
+            layer.requires_grad_(False)
+
+    def unfreeze(self):
+        self.requires_grad_(True)
 
 
 def positions(x):
@@ -92,7 +104,7 @@ class DummyTransformerEncoder(nn.Module):
     """A module for 'teacher' and 'student' models in curiosity class."""
     def __init__(self, n_token: int, d_model: int, n_output: int, n_head: int = 4, num_layers: int = 3):
         super().__init__()
-        max_len = 40
+        max_len = 32
         self.content_embd = nn.Embedding(n_token, d_model, padding_idx=0)
         self.positional_embd = nn.Embedding(max_len, d_model)
         layer = nn.TransformerEncoderLayer(d_model,
@@ -133,27 +145,45 @@ class CuriosityReward(nn.Module):
         """Given the state perform a single curiosity reward calculation (distill_loss) with a single backprop step"""
         # assuming state is on the same device as teacher and student models
         with torch.no_grad():
-            targets = ff.softmax(self._teacher(states) * self._t_temp + self._get_pad_mask(states), dim=-1)
+            targets = ff.softmax(self._teacher(states) * self._t_temp, dim=-1)
         self._optimizer.zero_grad()
-        inputs = self._student(states) * self._s_temp + self._get_pad_mask(states)
+        inputs = self._student(states) * self._s_temp
         reduce_dims = tuple(range(int(targets.ndim > 2)+1, targets.ndim))    # (0,) for unbatched and (1,...,n) for batched
-        distill_loss = ff.cross_entropy(inputs.transpose(-2, -1), targets.transpose(-2, -1))
-        distill_metric = ff.mse_loss(inputs.softmax(-1), targets, reduction="none").mean(dim=reduce_dims)
+        mask = self._get_pad_mask(states)
+        distill_loss = self.masked_loss(ff.cross_entropy,
+                                        inputs.transpose(-2, -1),
+                                        targets.transpose(-2, -1),
+                                        mask,
+                                        reduce_dims="all")
+        distill_metric = self.masked_loss(ff.mse_loss,
+                                          inputs.softmax(-1),
+                                          targets,
+                                          mask.unsqueeze(-1),
+                                          reduce_dims=reduce_dims).detach()
         distill_loss.backward()
         self._optimizer.step()
-        return distill_metric.detach() * self.scale
+        return distill_metric * self.scale
 
     def calibrate_scale(self, states: torch.Tensor, targ_reward: float):
         """Setting self.scale so that the output curiosity reward is approximately equal targ_reward"""
         with torch.no_grad():
-            targets = ff.softmax(self._teacher(states) * self._t_temp + self._get_pad_mask(states), dim=-1)
-            inputs = ff.softmax(self._student(states) * self._s_temp + self._get_pad_mask(states), dim=-1)
-        loss = ff.mse_loss(inputs, targets).item()
+            targets = ff.softmax(self._teacher(states) * self._t_temp, dim=-1)
+            inputs = ff.softmax(self._student(states) * self._s_temp, dim=-1)
+        loss = self.masked_loss(ff.mse_loss, inputs, targets, self._get_pad_mask(states).unsqueeze(-1))
         self.scale = (targ_reward/loss)
 
     @staticmethod
     def _get_pad_mask(states, pad_idx=0):
-        return torch.where(states == pad_idx, float("-inf"), 0.0)
+        return states != pad_idx
+
+    @staticmethod
+    def masked_loss(loss_fn, inp, targ, mask, reduce_dims: str | tuple = "all"):
+        loss = loss_fn(inp, targ, reduction="none") * mask
+        if reduce_dims == "all":
+            loss = loss.mean()
+        elif isinstance(reduce_dims, tuple):
+            loss = loss.mean(dim=reduce_dims)
+        return loss
 
     @property
     def device(self):
