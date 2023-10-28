@@ -3,8 +3,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as ff
 import torch.optim as optim
+from typing import List, Optional
 
-from data import get_data
+from data import get_data, TokenTrie, CharTokenizer
 from model import CharTransformer, save_checkpoint, load_checkpoint, SumRewards, WordReward, CuriosityRewardTransformer
 
 
@@ -19,14 +20,14 @@ def pretrain(config: dict):
     optimizer = optim.Adam(model.parameters(), lr=pretrain_cfg["lr"], weight_decay=pretrain_cfg["l2reg"])
     scheduler = optim.lr_scheduler.LambdaLR(optimizer,
                                             lambda ep: min(1, pretrain_cfg["lr_gamma"]**(ep - pretrain_cfg["warmup_epochs"])))
-    if pretrain_cfg["checkpoint"] is not None:
-        pass
+    if ckpt_path := pretrain_cfg["checkpoint"] is not None:
+        load_checkpoint(model, ckpt_path)       # TODO: add possibility to save/load models together with optimizers
     for epoch in range(pretrain_cfg["epochs"]):
         train_loss = train_epoch(model, optimizer, pretrain_dataloader, device)
         val_loss = val_epoch(model, pretrain_val_dataloader, device)
         scheduler.step()
         print(f"epoch {epoch}: train: {train_loss} | val: {val_loss}")
-        if (epoch + 1) % 35 == 0:
+        if (epoch + 1) % 20 == 0:
             save_checkpoint(model, f"./checkpoints/ChTrans_2_{val_loss:.4f}.pt")
     save_checkpoint(model, "./checkpoints/ChTrans_2_pretrained.pt")
     return model, tokenizer, token_word_checker, str_word_checker
@@ -62,43 +63,49 @@ def val_epoch(model, dataloader, device):
     return val_loss.item()
 
 
-def rl_train(model, tokenizer, token_trie, config, optimizer=None):
-    """"""
+def rl_train(model: nn.Module, tokenizer: CharTokenizer, token_trie: TokenTrie,
+             config: dict, optimizer: Optional[optim.Optimizer] = None, use_curiosity: bool = True):
+    """Fine-tuning the model on a word generation task using Reinforcement Learning"""
     rl_cfg = config["rl_cfg"]
-    self_critic, batch_size = rl_cfg["self_critic"], rl_cfg["batch_size"]
+    self_critic, batch_size, entr_penalty = rl_cfg["self_critic"], rl_cfg["batch_size"], rl_cfg["entr_penalty"]
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    curiosity_reward = CuriosityRewardTransformer(tokenizer.n_tokens)
-    word_reward = WordReward(token_trie, rl_cfg["status_reward_mapping"])
-    reward = SumRewards(word_reward, curiosity_reward).to(device)
+    reward = WordReward(token_trie, rl_cfg["status_reward_mapping"])
+    if use_curiosity:
+        curiosity_reward = CuriosityRewardTransformer(tokenizer.n_tokens)
+        # calibrate curiosity
+        with torch.no_grad():
+            batch = model.generate_sample(100)
+        curiosity_reward.calibrate_scale(batch[0], rl_cfg["initial_curiosity"])
+        reward = SumRewards(reward, curiosity_reward)
     model = model.to(device)
+    reward = reward.to(device)
     if optimizer is None:
         optimizer = optim.Adam(model.parameters(), lr=rl_cfg["lr"])
-    # calibrate curiosity
-    batch = model.generate_sample(100)
-    curiosity_reward.calibrate_scale(batch[0], rl_cfg["initial_curiosity"])      # TODO: check if this works properly
     for step in range(rl_cfg["steps"]):
-        mean_reward, seq = pg_step(model, reward, optimizer, batch_size, self_critic)
+        mean_reward, seq = pg_step(model, reward, optimizer, batch_size, self_critic, entr_penalty)
         # metrics = calculate_rl_metrics(seq, token_trie)
         print(f"Step {step}: Mean reward {mean_reward}")
 
 
-def pg_step(model, reward, optimizer, batch_size, self_critic=True):
-    """A single Vanilla Policy Gradient (aka REINFORCE) step"""
+def pg_step(model, reward, optimizer, batch_size: int, self_critic: bool =True, entr_penalty: float = 0.0):
+    """A single Policy Gradient (aka REINFORCE) step"""
+    model.train()
     optimizer.zero_grad()
-    seq, log_probs = model.generate_sample(batch_size)
+    seq, log_probs, entropy = model.generate_sample(batch_size)
     advantage = reward(seq)
     mean_rew = advantage.mean().item()
     if self_critic:
-        with torch.no_grad():
-            seq_baseline = model.generate_argmax(batch_size)
+        seq_baseline = model.generate_argmax(batch_size)
         advantage -= reward(seq_baseline)
-    pg_loss = -(advantage * log_probs).mean()
+    entropy[seq == 0] = 0.0
+    # entropy values are positive
+    pg_loss = -(advantage * log_probs + entr_penalty*entropy).mean()
     pg_loss.backward()
     optimizer.step()
     return mean_rew, seq
 
 
-def ppo_step(model, reward, optimizer, batch_size, self_critic=True):
+def ppo_step(model, reward, optimizer, batch_size: int, self_critic: bool =True, entr_penalty: float = 0.0):
     """A single Proximity Policy Optimization step"""
     pass
 
@@ -109,8 +116,21 @@ def calculate_rl_metrics(seq, token_trie):
 
 def load_config(fname="config.json") -> dict:
     with open(fname, "r") as f:
-        cfg = json.load(f)
-    return cfg
+        config = json.load(f)
+    return config
+
+
+@torch.no_grad()
+def evaluate(model, tokenizer, n_samples=50) -> List[str]:
+    model.eval()
+    seq, _, _ = model.generate_sample(n_samples)
+    return eval_sequence(seq, tokenizer)
+
+
+def eval_sequence(seq: torch.Tensor, tokenizer) -> List[str]:
+    seq = seq.cpu().tolist()
+    seq = tokenizer.decode(seq)
+    return seq
 
 
 def write_to_summary(writer, metrics: dict, global_step: int):
@@ -120,7 +140,9 @@ def write_to_summary(writer, metrics: dict, global_step: int):
 
 def main(config: dict):
     model, tokenizer, token_word_checker, str_word_checker = pretrain(config)
-    rl_train(model, tokenizer, token_word_checker, config, None)
+    # fine-tune only the last transformer layer and the model's 'head'
+    model.freeze_n_layers(config["model_cfg"]["num_layers"] - 1)
+    rl_train(model, tokenizer, token_word_checker, config, optimizer=None)
 
 
 if __name__ == "__main__":
