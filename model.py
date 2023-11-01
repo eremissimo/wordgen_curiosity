@@ -225,7 +225,8 @@ class WordReward(nn.Module):
         # Q(s,a) calculation (reverse cumsum)
         values = values @ torch.tril(torch.ones((maxn, maxn), device=device, dtype=torch.float32))
         # taking care of the final reward at the end of the word (or episode in the terms of RL)
-        full_word_reward = is_full_word * (self._full_word_reward - values[:, 0])
+        # full_word_reward = is_full_word * (self._full_word_reward - values[:, 0])
+        full_word_reward = is_full_word * self._full_word_reward
         values += filled_pad_mask * full_word_reward.unsqueeze(1)
         return values
 

@@ -20,7 +20,7 @@ def pretrain(config: dict):
     optimizer = optim.Adam(model.parameters(), lr=pretrain_cfg["lr"], weight_decay=pretrain_cfg["l2reg"])
     scheduler = optim.lr_scheduler.LambdaLR(optimizer,
                                             lambda ep: min(1, pretrain_cfg["lr_gamma"]**(ep - pretrain_cfg["warmup_epochs"])))
-    if ckpt_path := pretrain_cfg["checkpoint"] is not None:
+    if (ckpt_path := pretrain_cfg["checkpoint"]) is not None:
         load_checkpoint(model, ckpt_path)       # TODO: add possibility to save/load models together with optimizers
     for epoch in range(pretrain_cfg["epochs"]):
         train_loss = train_epoch(model, optimizer, pretrain_dataloader, device)
