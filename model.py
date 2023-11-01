@@ -3,7 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as ff
 import torch.optim as optim
 from torch.distributions import Categorical
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Tuple
+from itertools import count
+from contextlib import nullcontext
 
 
 class CharTransformer(nn.Module):
@@ -141,27 +143,30 @@ class CuriosityReward(nn.Module):
         self._t_temp, self._s_temp = temperature    # hyperparameter: sharpness of softmax distribution
         self.scale = scale                          # hyperparameter: scales up the resulting reward
 
-    def forward(self, states: torch.Tensor) -> torch.Tensor:
+    def forward(self, states: torch.Tensor, optim_step=True) -> torch.Tensor:
         """Given the state perform a single curiosity reward calculation (distill_loss) with a single backprop step"""
         # assuming state is on the same device as teacher and student models
         with torch.no_grad():
             targets = ff.softmax(self._teacher(states) * self._t_temp, dim=-1)
         self._optimizer.zero_grad()
+        # ctx = nullcontext() if optim_step else torch.no_grad()
+        # with ctx:
         inputs = self._student(states) * self._s_temp
         reduce_dims = tuple(range(int(targets.ndim > 2)+1, targets.ndim))    # (0,) for unbatched and (1,...,n) for batched
         mask = self._get_pad_mask(states)
-        distill_loss = self.masked_loss(ff.cross_entropy,
-                                        inputs.transpose(-2, -1),
-                                        targets.transpose(-2, -1),
-                                        mask,
-                                        reduce_dims="all")
         distill_metric = self.masked_loss(ff.mse_loss,
                                           inputs.softmax(-1),
                                           targets,
                                           mask.unsqueeze(-1),
                                           reduce_dims=reduce_dims).detach()
-        distill_loss.backward()
-        self._optimizer.step()
+        if optim_step:
+            distill_loss = self.masked_loss(ff.cross_entropy,
+                                            inputs.transpose(-2, -1),
+                                            targets.transpose(-2, -1),
+                                            mask,
+                                            reduce_dims="all")
+            distill_loss.backward()
+            self._optimizer.step()
         return distill_metric * self.scale
 
     def calibrate_scale(self, states: torch.Tensor, targ_reward: float):
@@ -225,7 +230,8 @@ class WordReward(nn.Module):
         # Q(s,a) calculation (reverse cumsum)
         values = values @ torch.tril(torch.ones((maxn, maxn), device=device, dtype=torch.float32))
         # taking care of the final reward at the end of the word (or episode in the terms of RL)
-        full_word_reward = is_full_word * (self._full_word_reward - values[:, 0])
+        # full_word_reward = is_full_word * (self._full_word_reward - values[:, 0])
+        full_word_reward = is_full_word * self._full_word_reward
         values += filled_pad_mask * full_word_reward.unsqueeze(1)
         return values
 
@@ -244,6 +250,74 @@ class SumRewards(nn.Module):
 
     def forward(self, states: torch.Tensor) -> torch.Tensor:
         return sum(reward(states) for reward in self.rewards)
+
+
+class DualAscentPGLoss(nn.Module):
+    """This reward class provides loss function for maximizing curiosity + lambda*word_reward with additional
+    Lagrange multiplier modification step (dual ascent).
+    This is derived from the optimization task of the form
+    max mean(curiosity(seq)) s.t. mean(word_reward(seq)) > threshold
+    """
+    def __init__(self, curiosity: CuriosityReward, reward: WordReward, target_reward: float, entr_penalty: float,
+                 initial_lambda=10.):
+        super().__init__()
+        self._curiosity = curiosity
+        self._reward = reward
+        _lambda = torch.tensor(initial_lambda, dtype=torch.float32, device=self.device, requires_grad=False)
+        self.register_buffer("_lambda", _lambda)
+        self._threshold = target_reward
+        self._step_gen = (n**-0.5 for n in count(5))
+        self._entr_penalty = entr_penalty
+
+    def update_target_reward(self, tgt_rew: float):
+        self._threshold = tgt_rew
+
+    def forward(self, states: torch.Tensor, log_probs: torch.Tensor, entropy: torch.Tensor,
+                states_baseline: Optional[torch.Tensor] = None, dual_ascent=True) -> Tuple[torch.Tensor, torch.Tensor]:
+        rewards = self._reward(states)
+        mean_rew = rewards[:, 0].mean()
+        advantage = self._curiosity(states) + self._lambda * rewards       # Q-values actually
+        if states_baseline is not None:
+            # and this is advantage values
+            advantage -= (self._curiosity(states_baseline, optim_step=False) + self._lambda * self._reward(states_baseline))
+        # A policy gradient loss. A gradient of it is similar to gradient of the main objective
+        pg_loss = - (advantage * log_probs + self._entr_penalty * entropy).mean()
+        # This is the main difference between usual pg method and this. The proportion between reward components
+        # (curiosity, word_reward) lambda is not static
+        if dual_ascent:
+            self.update_lagrange_multiplier(rewards[:, 0], log_probs.detach())
+        return pg_loss, mean_rew
+
+    def update_lagrange_multiplier(self, final_rewards: torch.Tensor, log_probs: torch.Tensor):
+        step = next(self._step_gen)
+        # exponentiation gives unnormalized probs, but softmax gives normalized.
+        # Isn't normalization justified from bayesian point of view?
+        probs = log_probs.sum(dim=1).softmax(0)
+        expected_reward = (final_rewards * probs).mean()       # TODO: or is it?
+        self._lambda -= step*(expected_reward - self._threshold)
+        self._lambda.relu_()
+
+    @property
+    def device(self):
+        return self._curiosity.device
+
+
+class RewardPGLoss(nn.Module):
+    def __init__(self, reward: WordReward, entr_penalty: float):
+        super().__init__()
+        self._reward = reward
+        self._entr_penalty = entr_penalty
+
+    def forward(self, states: torch.Tensor, log_probs: torch.Tensor, entropy: torch.Tensor,
+                states_baseline: Optional[torch.Tensor] = None):
+        advantage = self._reward(states)  # Q-values actually
+        mean_rew = advantage[:, 0].mean()
+        if states_baseline is not None:
+            # and this is advantage values
+            advantage -= self._reward(states_baseline)
+        # A policy gradient loss. A gradient of it is similar to gradient of the main objective
+        pg_loss = - (advantage * log_probs + self._entr_penalty * entropy).mean()
+        return pg_loss, mean_rew
 
 
 def save_checkpoint(model, path, optimizer=None):
@@ -313,7 +387,7 @@ if __name__ == "__main__":
 
     print("\n\n *********** \n\n")
     print("REINFORCE")
-    seq, log_probs = model.generate_sample(30, 6)
+    seq, log_probs, _ = model.generate_sample(30, 6)
     seq_baseline = model.generate_argmax(30, 6)
     advantage = rewards(seq) - rewards(seq_baseline)
     print(advantage)

@@ -254,6 +254,7 @@ def get_data(data_cfg: Dict) -> Tuple[DataLoader, DataLoader, CharTokenizer, Tok
     print("Dataset preparation ...", end="")
 
     dictionary = load_dictionary(data_cfg["path"], lower=True, filter_missing=False)
+    dictionary = dictionary[dictionary["word"].map(lambda x: len(x) > 1)]
     _deal_with_duplicates(dictionary, data_cfg["target_pos"])
     _add_train_test_split_column(dictionary, data_cfg["target_pos"], data_cfg["train_test_proportion"])
     alphabet = get_alphabet(dictionary["word"])
