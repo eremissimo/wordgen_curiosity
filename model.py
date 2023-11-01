@@ -255,7 +255,7 @@ def save_checkpoint(model, path, optimizer=None):
 
 
 def load_checkpoint(model, path):
-    model.load_state_dict(torch.load(path))
+    model.load_state_dict(torch.load(path, map_location=model.device))
 
 
 if __name__ == "__main__":

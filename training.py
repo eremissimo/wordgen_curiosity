@@ -75,7 +75,7 @@ def rl_train(model: nn.Module, tokenizer: CharTokenizer, token_trie: TokenTrie,
         # calibrate curiosity
         with torch.no_grad():
             batch = model.generate_sample(100)
-        curiosity_reward.calibrate_scale(batch[0], rl_cfg["initial_curiosity"])
+        curiosity_reward.calibrate_scale(batch[0].cpu(), rl_cfg["initial_curiosity"])
         reward = SumRewards(reward, curiosity_reward)
     model = model.to(device)
     reward = reward.to(device)
