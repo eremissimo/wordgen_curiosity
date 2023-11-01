@@ -93,7 +93,7 @@ def pg_step(model, reward, optimizer, batch_size: int, self_critic: bool =True, 
     optimizer.zero_grad()
     seq, log_probs, entropy = model.generate_sample(batch_size)
     advantage = reward(seq)
-    mean_rew = advantage.mean().item()
+    mean_rew = advantage[:, 0].mean().item()
     if self_critic:
         seq_baseline = model.generate_argmax(batch_size)
         advantage -= reward(seq_baseline)
@@ -142,7 +142,7 @@ def main(config: dict):
     model, tokenizer, token_word_checker, str_word_checker = pretrain(config)
     # fine-tune only the last transformer layer and the model's 'head'
     model.freeze_n_layers(config["model_cfg"]["num_layers"] - 1)
-    rl_train(model, tokenizer, token_word_checker, config, optimizer=None)
+    rl_train(model, tokenizer, token_word_checker, config, optimizer=None, use_curiosity=False)
 
 
 if __name__ == "__main__":
