@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as ff
 import torch.optim as optim
 from torch.distributions import Categorical
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Callable
 
 
 class CharTransformer(nn.Module):
@@ -130,38 +130,53 @@ class DummyTransformerEncoder(nn.Module):
 class CuriosityReward(nn.Module):
     """A distillation based curiosity. The agent gets more reward for getting to unfamiliar state
     (i.e. when there is a discrepancy between teacher and student model outputs)"""
-    def __init__(self, teacher: nn.Module, student: nn.Module, lr: float = 1e-3,
-                 temperature: float | Iterable[float] = 1., scale: float = 1.):
+    def __init__(self, mastermind: nn.Module, teacher: nn.Module, student: nn.Module, lr: float = 1e-3,
+                 temperature: float | Iterable[float] = 1., scale: float = 1., lr_t: Optional[float] = None):
         super().__init__()
+        self._mastermind = mastermind
         self._teacher = teacher
         self._student = student
-        self._optimizer = optim.Adam(self._student.parameters(), lr=lr)
+        self._s_optimizer = optim.AdamW(self._student.parameters(), lr=lr, weight_decay=1e-3)
+        lr_t = lr_t or lr/10.
+        self._t_optimizer = optim.AdamW(self._teacher.parameters(), lr=lr_t, weight_decay=1e-3)
         if not isinstance(temperature, Iterable):
-            temperature = (temperature, temperature)
-        self._t_temp, self._s_temp = temperature    # hyperparameter: sharpness of softmax distribution
+            temperature = (temperature, temperature, temperature)
+        self._m_temp, self._t_temp, self._s_temp = temperature    # hyperparameter: sharpness of softmax distribution
         self.scale = scale                          # hyperparameter: scales up the resulting reward
 
-    def forward(self, states: torch.Tensor) -> torch.Tensor:
+    def forward(self, states: torch.Tensor, optim_step=True) -> torch.Tensor:
         """Given the state perform a single curiosity reward calculation (distill_loss) with a single backprop step"""
         # assuming state is on the same device as teacher and student models
-        with torch.no_grad():
-            targets = ff.softmax(self._teacher(states) * self._t_temp, dim=-1)
-        self._optimizer.zero_grad()
-        inputs = self._student(states) * self._s_temp
-        reduce_dims = tuple(range(int(targets.ndim > 2)+1, targets.ndim))    # (0,) for unbatched and (1,...,n) for batched
+        if optim_step:
+            with torch.no_grad():
+                t_targets = ff.softmax(self._mastermind(states) * self._m_temp, dim=-1)
+            self._s_optimizer.zero_grad()
+            self._t_optimizer.zero_grad()
+        t_inputs = self._teacher(states) * self._t_temp
+        s_targets = t_inputs.detach().softmax(-1)
+        s_inputs = self._student(states) * self._s_temp
+        reduce_dims = tuple(range(int(s_targets.ndim > 2)+1, s_targets.ndim))    # (0,) for unbatched and (1,...,n) for batched
         mask = self._get_pad_mask(states)
-        distill_loss = self.masked_loss(ff.cross_entropy,
-                                        inputs.transpose(-2, -1),
-                                        targets.transpose(-2, -1),
-                                        mask,
-                                        reduce_dims="all")
         distill_metric = self.masked_loss(ff.mse_loss,
-                                          inputs.softmax(-1),
-                                          targets,
+                                          s_inputs.softmax(-1),
+                                          s_targets,
                                           mask.unsqueeze(-1),
                                           reduce_dims=reduce_dims).detach()
-        distill_loss.backward()
-        self._optimizer.step()
+        if optim_step:
+            distill_loss = self.masked_loss(ff.cross_entropy,
+                                            s_inputs.transpose(-2, -1),
+                                            s_targets.transpose(-2, -1),
+                                            mask,
+                                            reduce_dims="all")
+            distill_loss.backward()
+            self._s_optimizer.step()
+            drift_loss = self.masked_loss(ff.cross_entropy,
+                                          t_inputs.transpose(-2, -1),
+                                          t_targets.transpose(-2, -1),
+                                          mask,
+                                          reduce_dims="all")
+            drift_loss.backward()
+            self._t_optimizer.step()
         return distill_metric * self.scale
 
     def calibrate_scale(self, states: torch.Tensor, targ_reward: float):
@@ -192,12 +207,13 @@ class CuriosityReward(nn.Module):
 
 class CuriosityRewardTransformer(CuriosityReward):
     def __init__(self, n_token: int, lr: float = 1e-3,
-                 temperature: float | Iterable[float] = 1., scale: float = 1.):
+                 temperature: float | Iterable[float] = 1., scale: float = 1., lr_t: Optional[float] = None):
         out_size = 40
         d_model = 8
+        mastermind = DummyTransformerEncoder(n_token, d_model, out_size, 4, 1)
         teacher = DummyTransformerEncoder(n_token, d_model, out_size, 4, 2)
         student = DummyTransformerEncoder(n_token, d_model, out_size, 4, 2)
-        super().__init__(teacher, student, lr=lr, temperature=temperature, scale=scale)
+        super().__init__(mastermind, teacher, student, lr=lr, temperature=temperature, scale=scale, lr_t=lr_t)
 
 
 class WordReward(nn.Module):
@@ -251,6 +267,23 @@ class SumRewards(nn.Module):
         return sum(reward(states) for reward in self.rewards)
 
 
+class WeightedSumRewards(nn.Module):
+    def __init__(self, reward: WordReward, curiosity: CuriosityReward, coeff: float):
+        super().__init__()
+        self._reward = reward
+        self._curiosity = curiosity
+        self._coeff_src = coeff
+
+    def forward(self, states: torch.Tensor) -> torch.Tensor:
+        rew = self._reward(states)
+        if self._coeff_src:
+            rew += self._coeff_src * self._curiosity(states)
+        return rew
+
+    def update_weight(self, val: float):
+        self._coeff_src = float(val)
+
+
 class QValueAggregator(nn.Module):
     """Calculates Q-values as reverse cumulative reward"""
     def __init__(self, reward_module: nn.Module, max_len: int):
@@ -283,7 +316,7 @@ if __name__ == "__main__":
     data_cfg = {"path": "dictionary.csv",
                 "target_pos": "v. t.",
                 "train_test_proportion": (1, 2),
-                "batch_size": 4,
+                "batch_size": 10,
                 "num_workers": 0}
     model_cfg = {"max_word_len": 30,
                  "d_model": 8,
@@ -323,7 +356,7 @@ if __name__ == "__main__":
         curiosity(states)
     print("bored: ", curiosity(states))
     states2 = states.clone()
-    states2[:, 5:] = torch.randint(0, 30, (4, 21))
+    states2[:, 5:] = torch.randint(0, 30, (states2.shape[0], states2.shape[1]-5))
     print("partly bored: ", curiosity(states2))
 
     print("\n\n *********** \n\n")

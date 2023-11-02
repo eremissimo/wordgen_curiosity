@@ -7,10 +7,9 @@ import torch.nn.functional as ff
 import torch.optim as optim
 from typing import List, Optional, Callable
 
-
 from data import get_data, TokenTrie, CharTokenizer
-from model import CharTransformer, save_checkpoint, load_checkpoint, SumRewards, WordReward, \
-    CuriosityRewardTransformer, QValueAggregator
+from model import CharTransformer, save_checkpoint, load_checkpoint, WeightedSumRewards, \
+                   WordReward, CuriosityRewardTransformer, QValueAggregator
 
 
 def pretrain(config: dict):
@@ -77,18 +76,21 @@ def rl_train(model: nn.Module, tokenizer: CharTokenizer, token_trie: TokenTrie,
     device = "cuda" if torch.cuda.is_available() else "cpu"
     reward = WordReward(token_trie, rl_cfg["status_reward_mapping"])
     if use_curiosity:
-        curiosity_reward = CuriosityRewardTransformer(tokenizer.n_tokens, lr=1e-2, temperature=(20., 1.))
+        curiosity_reward = CuriosityRewardTransformer(tokenizer.n_tokens, lr=1e-2, temperature=(10., 5., 1.), lr_t=1e-3)
         # calibrate curiosity
         with torch.no_grad():
             batch = model.generate_sample(100)
         curiosity_reward.calibrate_scale(batch[0].cpu(), rl_cfg["initial_curiosity"])
-        reward = SumRewards(reward, curiosity_reward)
+        reward = WeightedSumRewards(reward, curiosity_reward, 0.)
+        coeff_upd_fun = lambda step: min(1., max(0., 0.01*(step - 10)))
     reward = QValueAggregator(reward_module=reward, max_len=max_len)
     model = model.to(device)
     reward = reward.to(device)
     if optimizer is None:
-        optimizer = optim.Adam(model.parameters(), lr=rl_cfg["lr"])
+        optimizer = optim.AdamW(model.parameters(), lr=rl_cfg["lr"], weight_decay=1e-3)
     for step in range(rl_cfg["steps"]):
+        if use_curiosity:
+            reward.update_weight(coeff_upd_fun(step))
         mean_reward, seq = pg_step(model, reward, optimizer, batch_size, self_critic, entr_penalty)
         # metrics = calculate_rl_metrics(seq, token_trie)
         print(f"Step {step}: Mean reward {mean_reward}")
@@ -114,7 +116,7 @@ def pg_step(model, reward, optimizer, batch_size: int, self_critic: bool = True,
     return mean_rew, seq
 
 
-def ppo_step(model, reward, optimizer, batch_size: int, self_critic: bool =True, entr_penalty: float = 0.0):
+def ppo_step(model, reward, optimizer, batch_size: int, self_critic: bool=True, entr_penalty: float = 0.0):
     """A single Proximity Policy Optimization step"""
     pass
 
@@ -186,6 +188,15 @@ def main(config: dict):
     # fine-tune only the last transformer layer and the model's 'head'
     model.freeze_n_layers(config["model_cfg"]["num_layers"] - 1)
     rl_train(model, tokenizer, token_word_checker, config, optimizer=None, use_curiosity=True)
+
+
+def param_range(model):
+    maxx = float("-inf")
+    minn = float("inf")
+    for par in model.parameters():
+        maxx = max(maxx, par.max().item())
+        minn = min(minn, par.min().item())
+    return minn, maxx
 
 
 if __name__ == "__main__":
