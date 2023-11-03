@@ -1,9 +1,10 @@
 import json
+import re
 import torch
 import torch.nn as nn
 import torch.nn.functional as ff
 import torch.optim as optim
-from typing import List, Optional
+from typing import List, Optional, Callable
 
 from data import get_data, TokenTrie, CharTokenizer
 from model import CharTransformer, save_checkpoint, load_checkpoint, SumRewards, WordReward, CuriosityRewardTransformer
@@ -71,7 +72,7 @@ def rl_train(model: nn.Module, tokenizer: CharTokenizer, token_trie: TokenTrie,
     device = "cuda" if torch.cuda.is_available() else "cpu"
     reward = WordReward(token_trie, rl_cfg["status_reward_mapping"])
     if use_curiosity:
-        curiosity_reward = CuriosityRewardTransformer(tokenizer.n_tokens)
+        curiosity_reward = CuriosityRewardTransformer(tokenizer.n_tokens, lr=1e-2, temperature=(20., 1.))
         # calibrate curiosity
         with torch.no_grad():
             batch = model.generate_sample(100)
@@ -85,6 +86,7 @@ def rl_train(model: nn.Module, tokenizer: CharTokenizer, token_trie: TokenTrie,
         mean_reward, seq = pg_step(model, reward, optimizer, batch_size, self_critic, entr_penalty)
         # metrics = calculate_rl_metrics(seq, token_trie)
         print(f"Step {step}: Mean reward {mean_reward}")
+        do_every_k_step(step, 10, eval_sequence, seq, tokenizer, n=20)
 
 
 def pg_step(model, reward, optimizer, batch_size: int, self_critic: bool =True, entr_penalty: float = 0.0):
@@ -120,6 +122,11 @@ def load_config(fname="config.json") -> dict:
     return config
 
 
+def do_every_k_step(step: int, k: int, fun: Callable, *args, **kwargs):
+    if (step % k) == 0:
+        fun(*args, **kwargs)
+
+
 @torch.no_grad()
 def evaluate(model, tokenizer, n_samples=50) -> List[str]:
     model.eval()
@@ -127,10 +134,18 @@ def evaluate(model, tokenizer, n_samples=50) -> List[str]:
     return eval_sequence(seq, tokenizer)
 
 
-def eval_sequence(seq: torch.Tensor, tokenizer) -> List[str]:
+def eval_sequence(seq: torch.Tensor, tokenizer, n: Optional[int] = None) -> List[str]:
     seq = seq.cpu().tolist()
+    if n is not None:
+        seq = seq[:n]
     seq = tokenizer.decode(seq)
-    return seq
+    seq = [extract_decoded(s) for s in seq]
+    print(seq)
+
+
+def extract_decoded(string):
+    result = re.search('<(.*)>', string)
+    return result.group(1)
 
 
 def write_to_summary(writer, metrics: dict, global_step: int):
