@@ -202,7 +202,7 @@ class CuriosityRewardTransformer(CuriosityReward):
 
 class WordReward(nn.Module):
     """Assigning reward when a generated word is present in the dictionary. Using TokenTrie for prefix search."""
-    def __init__(self, token_trie, status_reward_mapping: dict):
+    def __init__(self, token_trie, status_reward_mapping: dict, max_len=None):
         super().__init__()
         self._token_trie = token_trie
         padding_reward = 0.0
@@ -211,6 +211,8 @@ class WordReward(nn.Module):
         _reward_mapping_values = torch.tensor(_remapping_values, dtype=torch.float32)
         self.register_buffer("_reward_mapping_values", _reward_mapping_values)
         self._full_word_reward = status_reward_mapping["full_word"]
+        _cumsum_op = None if max_len is None else torch.tril(torch.ones((max_len, max_len), dtype=torch.float32))
+        self.register_buffer("_cumsum_op", _cumsum_op)
 
     def forward(self, token_words: torch.Tensor) -> torch.Tensor:
         maxn = token_words.shape[1]
@@ -223,11 +225,14 @@ class WordReward(nn.Module):
         values = torch.where(filled_pad_mask, values, -1)
         values = self._reward_mapping_values[values+1]
         # Q(s,a) calculation (reverse cumsum)
-        values = values @ torch.tril(torch.ones((maxn, maxn), device=device, dtype=torch.float32))
+        cso = self._cumsum_op if self._cumsum_op is not None else \
+            torch.tril(torch.ones((maxn, maxn), device=device, dtype=torch.float32))
+        values = values @ cso
         # taking care of the final reward at the end of the word (or episode in the terms of RL)
         # full_word_reward = is_full_word * (self._full_word_reward - values[:, 0])
-        full_word_reward = is_full_word * self._full_word_reward
-        values += filled_pad_mask * full_word_reward.unsqueeze(1)
+        if abs(self._full_word_reward) > 1e-3:
+            full_word_reward = is_full_word * self._full_word_reward
+            values += filled_pad_mask * full_word_reward.unsqueeze(1)
         return values
 
     @staticmethod
@@ -314,7 +319,7 @@ if __name__ == "__main__":
 
     print("\n\n *********** \n\n")
     print("REINFORCE")
-    seq, log_probs = model.generate_sample(30, 6)
+    seq, log_probs, _ = model.generate_sample(30, 6)
     seq_baseline = model.generate_argmax(30, 6)
     advantage = rewards(seq) - rewards(seq_baseline)
     print(advantage)
