@@ -1,10 +1,12 @@
 import json
 import re
+import collections
 import torch
 import torch.nn as nn
 import torch.nn.functional as ff
 import torch.optim as optim
 from typing import List, Optional, Callable
+
 
 from data import get_data, TokenTrie, CharTokenizer
 from model import CharTransformer, save_checkpoint, load_checkpoint, SumRewards, WordReward, CuriosityRewardTransformer
@@ -68,9 +70,11 @@ def rl_train(model: nn.Module, tokenizer: CharTokenizer, token_trie: TokenTrie,
              config: dict, optimizer: Optional[optim.Optimizer] = None, use_curiosity: bool = True):
     """Fine-tuning the model on a word generation task using Reinforcement Learning"""
     rl_cfg = config["rl_cfg"]
-    self_critic, batch_size, entr_penalty = rl_cfg["self_critic"], rl_cfg["batch_size"], rl_cfg["entr_penalty"]
+    max_len = config["model_cfg"]["max_word_len"]
+    self_critic, batch_size, entr_penalty, n_eval_batches = \
+        (rl_cfg[k] for k in ("self_critic", "batch_size", "entr_penalty", "n_eval_batches"))
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    reward = WordReward(token_trie, rl_cfg["status_reward_mapping"])
+    reward = WordReward(token_trie, rl_cfg["status_reward_mapping"], max_len=max_len)
     if use_curiosity:
         curiosity_reward = CuriosityRewardTransformer(tokenizer.n_tokens, lr=1e-2, temperature=(20., 1.))
         # calibrate curiosity
@@ -87,6 +91,7 @@ def rl_train(model: nn.Module, tokenizer: CharTokenizer, token_trie: TokenTrie,
         # metrics = calculate_rl_metrics(seq, token_trie)
         print(f"Step {step}: Mean reward {mean_reward}")
         do_every_k_step(step, 10, eval_sequence, seq, tokenizer, n=20)
+        do_every_k_step(step, 10, count_generated_word_types, model, batch_size, n_eval_batches, token_trie)
 
 
 def pg_step(model, reward, optimizer, batch_size: int, self_critic: bool =True, entr_penalty: float = 0.0):
@@ -116,6 +121,26 @@ def calculate_rl_metrics(seq, token_trie):
     pass
 
 
+@torch.no_grad()
+def count_generated_word_types(model, batch_size, n_batches, token_trie):
+    model.eval()
+    seq_list = []
+    for _ in range(n_batches):
+        seq, _, _ = model.generate_sample(batch_size)
+        seq_list.append(seq.cpu())
+    seq = torch.cat(seq_list, dim=0)
+    del seq_list
+    seq = seq.unique(sorted=False, dim=0)
+    n_dups = batch_size * n_batches - seq.shape[0]
+    # the first column of 'results' tensor is a word (prefix) type, the second one is the full word indicator
+    results: torch.Tensor = token_trie.check(seq)
+    results = results[results[:, 1] == 1]
+    results = results[:, 0].type(torch.uint8)
+    count = collections.Counter(results.tolist())
+    count = {k: count[v] for k, v in zip(["word", "test_word", "train_word"], [1, 2, 3])}
+    print(f" -- got {count} out of {batch_size*n_batches} generated word-likes with {n_dups} duplicates")
+
+
 def load_config(fname="config.json") -> dict:
     with open(fname, "r") as f:
         config = json.load(f)
@@ -128,13 +153,13 @@ def do_every_k_step(step: int, k: int, fun: Callable, *args, **kwargs):
 
 
 @torch.no_grad()
-def evaluate(model, tokenizer, n_samples=50) -> List[str]:
+def eval_model(model, tokenizer, n_samples=50):
     model.eval()
     seq, _, _ = model.generate_sample(n_samples)
-    return eval_sequence(seq, tokenizer)
+    eval_sequence(seq, tokenizer)
 
 
-def eval_sequence(seq: torch.Tensor, tokenizer, n: Optional[int] = None) -> List[str]:
+def eval_sequence(seq: torch.Tensor, tokenizer, n: Optional[int] = None):
     seq = seq.cpu().tolist()
     if n is not None:
         seq = seq[:n]
@@ -157,7 +182,7 @@ def main(config: dict):
     model, tokenizer, token_word_checker, str_word_checker = pretrain(config)
     # fine-tune only the last transformer layer and the model's 'head'
     model.freeze_n_layers(config["model_cfg"]["num_layers"] - 1)
-    rl_train(model, tokenizer, token_word_checker, config, optimizer=None, use_curiosity=False)
+    rl_train(model, tokenizer, token_word_checker, config, optimizer=None, use_curiosity=True)
 
 
 if __name__ == "__main__":
