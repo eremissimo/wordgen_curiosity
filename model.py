@@ -202,7 +202,7 @@ class CuriosityRewardTransformer(CuriosityReward):
 
 class WordReward(nn.Module):
     """Assigning reward when a generated word is present in the dictionary. Using TokenTrie for prefix search."""
-    def __init__(self, token_trie, status_reward_mapping: dict, max_len=None):
+    def __init__(self, token_trie, status_reward_mapping: dict):
         super().__init__()
         self._token_trie = token_trie
         padding_reward = 0.0
@@ -211,8 +211,6 @@ class WordReward(nn.Module):
         _reward_mapping_values = torch.tensor(_remapping_values, dtype=torch.float32)
         self.register_buffer("_reward_mapping_values", _reward_mapping_values)
         self._full_word_reward = status_reward_mapping["full_word"]
-        _cumsum_op = None if max_len is None else torch.tril(torch.ones((max_len, max_len), dtype=torch.float32))
-        self.register_buffer("_cumsum_op", _cumsum_op)
 
     def forward(self, token_words: torch.Tensor) -> torch.Tensor:
         maxn = token_words.shape[1]
@@ -224,15 +222,10 @@ class WordReward(nn.Module):
         filled_pad_mask = self._fill_holes_in_paddings_and_invert(values == -1)
         values = torch.where(filled_pad_mask, values, -1)
         values = self._reward_mapping_values[values+1]
-        # Q(s,a) calculation (reverse cumsum)
-        cso = self._cumsum_op if self._cumsum_op is not None else \
-            torch.tril(torch.ones((maxn, maxn), device=device, dtype=torch.float32))
-        values = values @ cso
         # taking care of the final reward at the end of the word (or episode in the terms of RL)
-        # full_word_reward = is_full_word * (self._full_word_reward - values[:, 0])
         if abs(self._full_word_reward) > 1e-3:
             full_word_reward = is_full_word * self._full_word_reward
-            values += filled_pad_mask * full_word_reward.unsqueeze(1)
+            self.add_final_rewards(values, full_word_reward, filled_pad_mask)
         return values
 
     @staticmethod
@@ -240,6 +233,12 @@ class WordReward(nn.Module):
         # [[0, 0, 1, 0, 1, 0, 0, 1, 1]] -> [[1, 1, 0, 0, 0, 0, 0, 0, 0]]
         return (torch.arange(mask.shape[1], dtype=torch.short, device=mask.device).unsqueeze(0) <
                 mask.short().argmax(dim=1, keepdim=True))
+
+    @staticmethod
+    def add_final_rewards(values, final_rewards, pad_mask):
+        last_char_idxs = pad_mask.short().argmin(dim=1) - 1
+        row_idxs = torch.arange(values.shape[0], device=values.device)
+        values[row_idxs, last_char_idxs] += final_rewards
 
 
 class SumRewards(nn.Module):
@@ -250,6 +249,21 @@ class SumRewards(nn.Module):
 
     def forward(self, states: torch.Tensor) -> torch.Tensor:
         return sum(reward(states) for reward in self.rewards)
+
+
+class QValueAggregator(nn.Module):
+    """Calculates Q-values as reverse cumulative reward"""
+    def __init__(self, reward_module: nn.Module, max_len: int):
+        super().__init__()
+        self._reward = reward_module
+        # a linear operator matrix of reverse cumsum
+        rev_cumsum_op = torch.tril(torch.ones((max_len, max_len), dtype=torch.float32))
+        self.register_buffer("_rev_cumsum_op", rev_cumsum_op)
+
+    def forward(self, states: torch.Tensor) -> torch.Tensor:
+        values = self._reward(states)
+        values = values @ self._rev_cumsum_op
+        return values
 
 
 def save_checkpoint(model, path, optimizer=None):

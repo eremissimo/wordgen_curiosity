@@ -9,7 +9,8 @@ from typing import List, Optional, Callable
 
 
 from data import get_data, TokenTrie, CharTokenizer
-from model import CharTransformer, save_checkpoint, load_checkpoint, SumRewards, WordReward, CuriosityRewardTransformer
+from model import CharTransformer, save_checkpoint, load_checkpoint, SumRewards, WordReward, \
+    CuriosityRewardTransformer, QValueAggregator
 
 
 def pretrain(config: dict):
@@ -74,7 +75,7 @@ def rl_train(model: nn.Module, tokenizer: CharTokenizer, token_trie: TokenTrie,
     self_critic, batch_size, entr_penalty, n_eval_batches = \
         (rl_cfg[k] for k in ("self_critic", "batch_size", "entr_penalty", "n_eval_batches"))
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    reward = WordReward(token_trie, rl_cfg["status_reward_mapping"], max_len=max_len)
+    reward = WordReward(token_trie, rl_cfg["status_reward_mapping"])
     if use_curiosity:
         curiosity_reward = CuriosityRewardTransformer(tokenizer.n_tokens, lr=1e-2, temperature=(20., 1.))
         # calibrate curiosity
@@ -82,6 +83,7 @@ def rl_train(model: nn.Module, tokenizer: CharTokenizer, token_trie: TokenTrie,
             batch = model.generate_sample(100)
         curiosity_reward.calibrate_scale(batch[0].cpu(), rl_cfg["initial_curiosity"])
         reward = SumRewards(reward, curiosity_reward)
+    reward = QValueAggregator(reward_module=reward, max_len=max_len)
     model = model.to(device)
     reward = reward.to(device)
     if optimizer is None:
@@ -94,7 +96,7 @@ def rl_train(model: nn.Module, tokenizer: CharTokenizer, token_trie: TokenTrie,
         do_every_k_step(step, 10, count_generated_word_types, model, batch_size, n_eval_batches, token_trie)
 
 
-def pg_step(model, reward, optimizer, batch_size: int, self_critic: bool =True, entr_penalty: float = 0.0):
+def pg_step(model, reward, optimizer, batch_size: int, self_critic: bool = True, entr_penalty: float = 0.0):
     """A single Policy Gradient (aka REINFORCE) step"""
     model.train()
     optimizer.zero_grad()
@@ -170,7 +172,8 @@ def eval_sequence(seq: torch.Tensor, tokenizer, n: Optional[int] = None):
 
 def extract_decoded(string):
     result = re.search('<(.*)>', string)
-    return result.group(1)
+    string = "" if result is None else result.group(1)
+    return string
 
 
 def write_to_summary(writer, metrics: dict, global_step: int):
