@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as ff
 import torch.optim as optim
-from typing import List, Optional, Callable
+from typing import Optional, Callable
 
 from data import get_data, TokenTrie, CharTokenizer
 from model import CharTransformer, save_checkpoint, load_checkpoint, WeightedSumRewards, \
@@ -30,8 +30,7 @@ def pretrain(config: dict):
         val_loss = val_epoch(model, pretrain_val_dataloader, device)
         scheduler.step()
         print(f"epoch {epoch}: train: {train_loss} | val: {val_loss}")
-        if (epoch + 1) % 20 == 0:
-            save_checkpoint(model, f"./checkpoints/ChTrans_2_{val_loss:.4f}.pt")
+        do_every_k_step(epoch, 20, save_checkpoint, model, f"./checkpoints/ChTrans_2_{val_loss:.4f}.pt")
     save_checkpoint(model, "./checkpoints/ChTrans_2_pretrained.pt")
     return model, tokenizer, token_word_checker, str_word_checker
 
@@ -67,12 +66,12 @@ def val_epoch(model, dataloader, device):
 
 
 def rl_train(model: nn.Module, tokenizer: CharTokenizer, token_trie: TokenTrie,
-             config: dict, optimizer: Optional[optim.Optimizer] = None, use_curiosity: bool = True):
+             config: dict, optimizer: Optional[optim.Optimizer] = None):
     """Fine-tuning the model on a word generation task using Reinforcement Learning"""
     rl_cfg = config["rl_cfg"]
     max_len = config["model_cfg"]["max_word_len"]
-    self_critic, batch_size, entr_penalty, n_eval_batches = \
-        (rl_cfg[k] for k in ("self_critic", "batch_size", "entr_penalty", "n_eval_batches"))
+    self_critic, use_curiosity, batch_size, entr_penalty, n_eval_batches = \
+        (rl_cfg[k] for k in ("self_critic", "use_curiosity", "batch_size", "entr_penalty", "n_eval_batches"))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     reward = WordReward(token_trie, rl_cfg["status_reward_mapping"])
     if use_curiosity:
@@ -82,7 +81,8 @@ def rl_train(model: nn.Module, tokenizer: CharTokenizer, token_trie: TokenTrie,
             batch = model.generate_sample(100)
         curiosity_reward.calibrate_scale(batch[0].cpu(), rl_cfg["initial_curiosity"])
         reward = WeightedSumRewards(reward, curiosity_reward, 0.)
-        coeff_upd_fun = lambda step: min(1., max(0., 0.01*(step - 10)))
+        coeff_upd_fun = lambda step: min(1., max(0., 0.01*(step - 0)))
+        # coeff_upd_fun = lambda step: 1
     reward = QValueAggregator(reward_module=reward, max_len=max_len)
     model = model.to(device)
     reward = reward.to(device)
@@ -90,7 +90,7 @@ def rl_train(model: nn.Module, tokenizer: CharTokenizer, token_trie: TokenTrie,
         optimizer = optim.AdamW(model.parameters(), lr=rl_cfg["lr"], weight_decay=1e-3)
     for step in range(rl_cfg["steps"]):
         if use_curiosity:
-            reward.update_weight(coeff_upd_fun(step))
+            reward._reward.update_weight(coeff_upd_fun(step))
         mean_reward, seq = pg_step(model, reward, optimizer, batch_size, self_critic, entr_penalty)
         # metrics = calculate_rl_metrics(seq, token_trie)
         print(f"Step {step}: Mean reward {mean_reward}")
@@ -103,10 +103,12 @@ def pg_step(model, reward, optimizer, batch_size: int, self_critic: bool = True,
     model.train()
     optimizer.zero_grad()
     seq, log_probs, entropy = model.generate_sample(batch_size)
+    seq, log_probs, entropy = refine_predictions(seq, log_probs, entropy)
     advantage = reward(seq)
     mean_rew = advantage[:, 0].mean().item()
     if self_critic:
         seq_baseline = model.generate_argmax(batch_size)
+        seq_baseline = refine_predictions(seq_baseline)[0]
         advantage -= reward(seq_baseline)
     entropy[seq == 0] = 0.0
     # entropy values are positive
@@ -114,6 +116,20 @@ def pg_step(model, reward, optimizer, batch_size: int, self_critic: bool = True,
     pg_loss.backward()
     optimizer.step()
     return mean_rew, seq
+
+
+def refine_predictions(*tensors):
+    """Get rid of some cursed predictions: '<word-like>**<<asdf><**' -> '<word-like>**********' """
+    end_token = 2    # :/
+    filled_pad_mask = tensors[0] == end_token
+    has_end, arg_first_end = filled_pad_mask.max(dim=1, keepdim=True)
+    arg_first_end[~has_end] = filled_pad_mask.shape[1] - 1
+    filled_pad_mask = (torch.arange(filled_pad_mask.shape[1],
+                                    dtype=torch.short,
+                                    device=filled_pad_mask.device).unsqueeze(0) > arg_first_end)
+    for t in tensors:
+        t[filled_pad_mask] = 0
+    return tensors
 
 
 def ppo_step(model, reward, optimizer, batch_size: int, self_critic: bool=True, entr_penalty: float = 0.0):
@@ -187,7 +203,7 @@ def main(config: dict):
     model, tokenizer, token_word_checker, str_word_checker = pretrain(config)
     # fine-tune only the last transformer layer and the model's 'head'
     model.freeze_n_layers(config["model_cfg"]["num_layers"] - 1)
-    rl_train(model, tokenizer, token_word_checker, config, optimizer=None, use_curiosity=True)
+    rl_train(model, tokenizer, token_word_checker, config, optimizer=None)
 
 
 def param_range(model):

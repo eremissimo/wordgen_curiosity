@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as ff
 import torch.optim as optim
 from torch.distributions import Categorical
-from typing import Iterable, Optional, Callable
+from typing import Iterable, Optional
 
 
 class CharTransformer(nn.Module):
@@ -226,45 +226,22 @@ class WordReward(nn.Module):
                                                    ["nonword_char", "word_char", "test_word_char", "train_word_char"]]
         _reward_mapping_values = torch.tensor(_remapping_values, dtype=torch.float32)
         self.register_buffer("_reward_mapping_values", _reward_mapping_values)
-        self._full_word_reward = status_reward_mapping["full_word"]
+        self._full_word_reward = status_reward_mapping["full_word"] or 0.0
 
     def forward(self, token_words: torch.Tensor) -> torch.Tensor:
+        end_token = 2
         maxn = token_words.shape[1]
         device = token_words.device
+        end_idxs = (token_words == end_token).nonzero()
         # token trie is cpu-only thing
-        token_words = token_words.cpu()
-        values, is_full_word = (x.to(device) for x in self._token_trie.word_values(token_words))
+        values, is_full_word = (x.to(device) for x in self._token_trie.word_values(token_words.cpu()))
         # all the following computations are performed on device
-        filled_pad_mask = self._fill_holes_in_paddings_and_invert(values == -1)
-        values = torch.where(filled_pad_mask, values, -1)
         values = self._reward_mapping_values[values+1]
         # taking care of the final reward at the end of the word (or episode in the terms of RL)
         if abs(self._full_word_reward) > 1e-3:
             full_word_reward = is_full_word * self._full_word_reward
-            self.add_final_rewards(values, full_word_reward, filled_pad_mask)
+            values[end_idxs[:, 0], end_idxs[:, 1]] += full_word_reward[end_idxs[:, 0]]
         return values
-
-    @staticmethod
-    def _fill_holes_in_paddings_and_invert(mask: torch.Tensor) -> torch.Tensor:
-        # [[0, 0, 1, 0, 1, 0, 0, 1, 1]] -> [[1, 1, 0, 0, 0, 0, 0, 0, 0]]
-        return (torch.arange(mask.shape[1], dtype=torch.short, device=mask.device).unsqueeze(0) <
-                mask.short().argmax(dim=1, keepdim=True))
-
-    @staticmethod
-    def add_final_rewards(values, final_rewards, pad_mask):
-        last_char_idxs = pad_mask.short().argmin(dim=1) - 1
-        row_idxs = torch.arange(values.shape[0], device=values.device)
-        values[row_idxs, last_char_idxs] += final_rewards
-
-
-class SumRewards(nn.Module):
-    """Calculates a sum of the individual reward modules' output"""
-    def __init__(self, *reward_modules):
-        super().__init__()
-        self.rewards = nn.ModuleList(reward_modules)
-
-    def forward(self, states: torch.Tensor) -> torch.Tensor:
-        return sum(reward(states) for reward in self.rewards)
 
 
 class WeightedSumRewards(nn.Module):
