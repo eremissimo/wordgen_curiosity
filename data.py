@@ -132,6 +132,7 @@ class CharTrie:
     def __init__(self, modify_value_fn=max):
         self.root = CharTrieNode()
         self.node_count = 0
+        self.summary = [0] * len(WordStatus)
         self._modify_value_fn = modify_value_fn     # this takes the current node value, other value and produces a
                                                     # new value for the current node
 
@@ -146,6 +147,7 @@ class CharTrie:
                     else self._modify_value_fn(current_node.value, value)
             current_node = current_node.children[char]
         current_node.is_full_word = True
+        self.summary[value.value] += 1
 
     def from_iterable(self, words: Iterable[str], values: Iterable[WordStatus]):
         """Building the trie from iterables"""
@@ -185,6 +187,7 @@ class TokenTrie:
         self.padding_idx = padding_idx
         self.out_pad_idx = output_pad_idx
         self._modify_value_fn = modify_value_fn  # this takes the current node value, other value and produces a
+        self.summary = [0]*len(WordStatus)
         # new value for the current node
 
     def insert(self, tokenized_word: Iterable[int], value: int):
@@ -203,6 +206,7 @@ class TokenTrie:
                     else self._modify_value_fn(current_node.value, value)
             current_node = current_node.children[idx]
         current_node.is_full_word = True
+        self.summary[value] += 1
 
     def from_iterable(self, tokenized_words: Iterable[Iterable[int]], values: Iterable[int]):
         """Building the trie from iterables"""

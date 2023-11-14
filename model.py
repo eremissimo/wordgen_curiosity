@@ -35,7 +35,7 @@ class CharTransformer(nn.Module):
     def device(self):
         return next(self.content_embd.parameters()).device
 
-    def predict_sample(self, x):
+    def predict_sample_train(self, x):
         # predict next tokens by sampling the probability defined by logits
         logits = self.forward(x)[..., -1:, :]   # [batch, 1, n_tokens]
         dist = Categorical(logits=logits)
@@ -48,26 +48,45 @@ class CharTransformer(nn.Module):
         tokens = logits.argmax(dim=-1)
         return tokens
 
-    def generate_sample(self, batch_size: int, n: Optional[int] = None):
-        if n is None:
-            n = self.max_word_len
-        elif n > self.max_word_len:
-            raise ValueError(f"Cannot generate more than {self.max_word_len=} tokens")
-        device = self.device
-        token = torch.ones((batch_size, 1), dtype=torch.long, device=device)   # begin word token
+    def predict_sample(self, x):
+        # predict in sampling mode for evaluation
+        logits = self.forward(x)[..., -1:, :]   # [batch, 1, n_tokens]
+        dist = Categorical(logits=logits)
+        tokens = dist.sample()
+        return tokens
+
+    def generate_sample_train(self, batch_size: int, n: Optional[int] = None):
+        # this method is used in rl training
+        token, output, n, device = self._prepare_gen(batch_size, n)
         log_probs = torch.zeros((batch_size, 1), dtype=torch.float32, device=device, requires_grad=False)
         entropy = log_probs.clone()
-        output = token.clone()
         for i in range(1, n):
-            token, logp, entr = self.predict_sample(output)
+            token, logp, entr = self.predict_sample_train(output)
             output = torch.cat((output, token), dim=-1)
             log_probs = torch.cat((log_probs, logp), dim=-1)
             entropy = torch.cat((entropy, entr), dim=-1)
         return output, log_probs, entropy
 
     @torch.no_grad()
+    def generate_sample(self, batch_size: int, n: Optional[int] = None):
+        # this method is used for sampling at evaluation
+        token, output, n, _ = self._prepare_gen(batch_size, n)
+        for i in range(1, n):
+            token = self.predict_sample(output)
+            output = torch.cat((output, token), dim=-1)
+        return output
+
+    @torch.no_grad()
     def generate_argmax(self, batch_size: int, n: Optional[int] = None):
-        # this method is not used for training (unlike generate_sample) hence the no_grad deco
+        # this method is not used for training (unlike generate_sample_train) hence the no_grad deco
+        token, output, n, _ = self._prepare_gen(batch_size, n)
+        for i in range(1, n):
+            token = self.predict_argmax(output)
+            output = torch.cat((output, token), dim=-1)
+        return output
+
+    def _prepare_gen(self, batch_size, n):
+        # common code for generate_xxx functions
         if n is None:
             n = self.max_word_len
         elif n > self.max_word_len:
@@ -75,16 +94,16 @@ class CharTransformer(nn.Module):
         device = self.device
         token = torch.ones((batch_size, 1), dtype=torch.long, device=device)  # begin word token
         output = token.clone()
-        for i in range(1, n):
-            token = self.predict_argmax(output)
-            output = torch.cat((output, token), dim=-1)
-        return output
+        return token, output, n, device
 
     def freeze_n_layers(self, n: int):
         self.content_embd.requires_grad_(False)
         self.positional_embd.requires_grad_(False)
         for layer in self.decoder.layers[:n]:
             layer.requires_grad_(False)
+
+    def freeze(self):
+        self.requires_grad_(False)
 
     def unfreeze(self):
         self.requires_grad_(True)
@@ -102,6 +121,7 @@ def generate_square_subsequent_mask(size, device):
 
 class DummyTransformerEncoder(nn.Module):
     """A module for 'teacher' and 'student' models in curiosity class."""
+    # TODO: make this a base class for CharTransformer to keep it DRY
     def __init__(self, n_token: int, d_model: int, n_output: int, n_head: int = 4, num_layers: int = 3):
         super().__init__()
         max_len = 32
@@ -136,13 +156,14 @@ class CuriosityReward(nn.Module):
         self._mastermind = mastermind
         self._teacher = teacher
         self._student = student
-        self._s_optimizer = optim.AdamW(self._student.parameters(), lr=lr, weight_decay=1e-3)
+        self._s_optimizer = optim.AdamW(self._student.parameters(), lr=lr, weight_decay=1e-4)
         lr_t = lr_t or lr/10.
-        self._t_optimizer = optim.AdamW(self._teacher.parameters(), lr=lr_t, weight_decay=1e-3)
+        self._t_optimizer = optim.AdamW(self._teacher.parameters(), lr=lr_t, weight_decay=1e-4)
         if not isinstance(temperature, Iterable):
             temperature = (temperature, temperature, temperature)
         self._m_temp, self._t_temp, self._s_temp = temperature    # hyperparameter: sharpness of softmax distribution
         self.scale = scale                          # hyperparameter: scales up the resulting reward
+        self.register_buffer("_targ_reward", torch.tensor([float("inf")], device=self.device))
 
     def forward(self, states: torch.Tensor, optim_step=True) -> torch.Tensor:
         """Given the state perform a single curiosity reward calculation (distill_loss) with a single backprop step"""
@@ -177,7 +198,7 @@ class CuriosityReward(nn.Module):
                                           reduce_dims="all")
             drift_loss.backward()
             self._t_optimizer.step()
-        return distill_metric * self.scale
+        return torch.minimum(distill_metric * self.scale, self._targ_reward)
 
     def calibrate_scale(self, states: torch.Tensor, targ_reward: float):
         """Setting self.scale so that the output curiosity reward is approximately equal targ_reward"""
@@ -186,6 +207,7 @@ class CuriosityReward(nn.Module):
             inputs = ff.softmax(self._student(states) * self._s_temp, dim=-1)
         loss = self.masked_loss(ff.mse_loss, inputs, targets, self._get_pad_mask(states).unsqueeze(-1))
         self.scale = (targ_reward/loss)
+        self._targ_reward[0] = targ_reward
 
     @staticmethod
     def _get_pad_mask(states, pad_idx=0):
@@ -210,7 +232,7 @@ class CuriosityRewardTransformer(CuriosityReward):
                  temperature: float | Iterable[float] = 1., scale: float = 1., lr_t: Optional[float] = None):
         out_size = 40
         d_model = 8
-        mastermind = DummyTransformerEncoder(n_token, d_model, out_size, 4, 1)
+        mastermind = DummyTransformerEncoder(n_token, d_model, out_size, 4, 2)
         teacher = DummyTransformerEncoder(n_token, d_model, out_size, 4, 2)
         student = DummyTransformerEncoder(n_token, d_model, out_size, 4, 2)
         super().__init__(mastermind, teacher, student, lr=lr, temperature=temperature, scale=scale, lr_t=lr_t)
@@ -251,10 +273,10 @@ class WeightedSumRewards(nn.Module):
         self._curiosity = curiosity
         self._coeff_src = coeff
 
-    def forward(self, states: torch.Tensor) -> torch.Tensor:
+    def forward(self, states: torch.Tensor, optim_step=True) -> torch.Tensor:
         rew = self._reward(states)
         if self._coeff_src:
-            rew += self._coeff_src * self._curiosity(states)
+            rew += self._coeff_src * self._curiosity(states, optim_step=optim_step)
         return rew
 
     def update_weight(self, val: float):
@@ -270,8 +292,8 @@ class QValueAggregator(nn.Module):
         rev_cumsum_op = torch.tril(torch.ones((max_len, max_len), dtype=torch.float32))
         self.register_buffer("_rev_cumsum_op", rev_cumsum_op)
 
-    def forward(self, states: torch.Tensor) -> torch.Tensor:
-        values = self._reward(states)
+    def forward(self, states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        values = self._reward(states, *args, **kwargs)
         values = values @ self._rev_cumsum_op
         return values
 
@@ -343,7 +365,7 @@ if __name__ == "__main__":
 
     print("\n\n *********** \n\n")
     print("REINFORCE")
-    seq, log_probs, _ = model.generate_sample(30, 6)
+    seq, log_probs, _ = model.generate_sample_train(30, 6)
     seq_baseline = model.generate_argmax(30, 6)
     advantage = rewards(seq) - rewards(seq_baseline)
     print(advantage)

@@ -6,6 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as ff
 import torch.optim as optim
 from typing import Optional, Callable
+from copy import deepcopy
+from tqdm import tqdm
 
 from data import get_data, TokenTrie, CharTokenizer
 from model import CharTransformer, save_checkpoint, load_checkpoint, WeightedSumRewards, \
@@ -75,13 +77,12 @@ def rl_train(model: nn.Module, tokenizer: CharTokenizer, token_trie: TokenTrie,
     device = "cuda" if torch.cuda.is_available() else "cpu"
     reward = WordReward(token_trie, rl_cfg["status_reward_mapping"])
     if use_curiosity:
-        curiosity_reward = CuriosityRewardTransformer(tokenizer.n_tokens, lr=1e-2, temperature=(10., 5., 1.), lr_t=1e-3)
+        curiosity_reward = CuriosityRewardTransformer(tokenizer.n_tokens, lr=1e-2, temperature=(4., 1., 1.), lr_t=1e-3)
         # calibrate curiosity
-        with torch.no_grad():
-            batch = model.generate_sample(100)
-        curiosity_reward.calibrate_scale(batch[0].cpu(), rl_cfg["initial_curiosity"])
+        batch = model.generate_sample(100)
+        curiosity_reward.calibrate_scale(batch.cpu(), rl_cfg["initial_curiosity"])
         reward = WeightedSumRewards(reward, curiosity_reward, 0.)
-        coeff_upd_fun = lambda step: min(1., max(0., 0.01*(step - 0)))
+        coeff_upd_fun = lambda step: min(1., max(0., 0.02*(step - 0)))
         # coeff_upd_fun = lambda step: 1
     reward = QValueAggregator(reward_module=reward, max_len=max_len)
     model = model.to(device)
@@ -102,14 +103,14 @@ def pg_step(model, reward, optimizer, batch_size: int, self_critic: bool = True,
     """A single Policy Gradient (aka REINFORCE) step"""
     model.train()
     optimizer.zero_grad()
-    seq, log_probs, entropy = model.generate_sample(batch_size)
+    seq, log_probs, entropy = model.generate_sample_train(batch_size)
     seq, log_probs, entropy = refine_predictions(seq, log_probs, entropy)
     advantage = reward(seq)
     mean_rew = advantage[:, 0].mean().item()
     if self_critic:
         seq_baseline = model.generate_argmax(batch_size)
         seq_baseline = refine_predictions(seq_baseline)[0]
-        advantage -= reward(seq_baseline)
+        advantage -= reward(seq_baseline, optim_step=False)
     entropy[seq == 0] = 0.0
     # entropy values are positive
     pg_loss = -(advantage * log_probs + entr_penalty*entropy).mean()
@@ -141,12 +142,11 @@ def calculate_rl_metrics(seq, token_trie):
     pass
 
 
-@torch.no_grad()
 def count_generated_word_types(model, batch_size, n_batches, token_trie):
     model.eval()
     seq_list = []
     for _ in range(n_batches):
-        seq, _, _ = model.generate_sample(batch_size)
+        seq = model.generate_sample(batch_size)
         seq_list.append(seq.cpu())
     seq = torch.cat(seq_list, dim=0)
     del seq_list
@@ -172,10 +172,9 @@ def do_every_k_step(step: int, k: int, fun: Callable, *args, **kwargs):
         fun(*args, **kwargs)
 
 
-@torch.no_grad()
 def eval_model(model, tokenizer, n_samples=50):
     model.eval()
-    seq, _, _ = model.generate_sample(n_samples)
+    seq = model.generate_sample(n_samples)
     eval_sequence(seq, tokenizer)
 
 
@@ -189,6 +188,7 @@ def eval_sequence(seq: torch.Tensor, tokenizer, n: Optional[int] = None):
 
 
 def extract_decoded(string):
+    """ '<word-like>***********' -> 'word-like'  """
     result = re.search('<(.*)>', string)
     string = "" if result is None else result.group(1)
     return string
@@ -206,17 +206,38 @@ def main(config: dict):
     rl_train(model, tokenizer, token_word_checker, config, optimizer=None)
 
 
-def param_range(model):
-    maxx = float("-inf")
-    minn = float("inf")
-    for par in model.parameters():
-        maxx = max(maxx, par.max().item())
-        minn = min(minn, par.min().item())
-    return minn, maxx
+def word_discovery(config: dict, batch_size: int, n_batches: int, use_checkpoint: Optional[str] = None):
+    config = deepcopy(config)
+    config["pretrain_cfg"]["epochs"] = 0        # skip pretraining, only load data
+    if use_checkpoint is not None:
+        config["pretrain_cfg"]["checkpoint"] = use_checkpoint
+    model, tokenizer, token_word_checker, _ = pretrain(config)
+    n_verbs_overall = token_word_checker.summary[2]
+    model.freeze()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    model.eval()
+    trans_verbs = set()
+    test_word_type = 2
+    for _ in tqdm(range(n_batches)):
+        seq = model.generate_sample(batch_size)
+        word_type: torch.Tensor = token_word_checker.check(seq.cpu())
+        # taking only full words from test data
+        seq = seq[(word_type[:, 0] == test_word_type) & word_type[:, 1].bool()]
+        if seq.shape[0] == 0:
+            continue
+        words_str = tokenizer.decode(seq.tolist())
+        trans_verbs.update(map(extract_decoded, words_str))
+    print("WordDiscovery: ")
+    print(" - model checkpoint: ", config["pretrain_cfg"]["checkpoint"])
+    print(f" - found verbs: {len(trans_verbs)}/{n_verbs_overall} from {batch_size*n_batches} samples")
+    return trans_verbs
 
 
 if __name__ == "__main__":
     cfg = load_config("config_2.json")
     main(cfg)
+    # verbs = word_discovery(cfg, 2048, 100, use_checkpoint="checkpoints/ChTrans_382_entr.pt")
+    # print(verbs)
 
     print("woah!")
