@@ -24,44 +24,46 @@ The whole dictionary of words is split up in three sets
 * training word (training set of transitive verbs, ~3000 words)
 * test word (test set of transitive verbs, ~6000 words)  
 
-For the sake of simplicity and to prevent any data leakage to from test set,  
-we take the words belongs to only one part of speech. If the word can be regarded 
-as a transitive verb then it's treated as a transitive verb only. For the rest
-words duplicates are deleted as their p.o.s is not relevant.
+For the sake of simplicity and to prevent any data leakage from the test set,  
+we assume the words can't be of multiple part of speech. If the word can be 
+regarded as a transitive verb then it's treated as a transitive verb only. 
+For the rest of the words duplicates are deleted as their p.o.s is not 
+relevant.
 
 The pretraining phase is performed over the union of 'word' and 
 'training word' sets.
 
 Then comes the RL-tuning phase. The models are trained to minimize 
-a policy gradient loss 
+the policy gradient loss 
 ```math
 L(\theta) = - \frac 1 K \sum_{k} (Q(s_{1..k}) - \bar Q(\bar s_{1..k})) \log p(s_k | s_{1..k-1}, \theta)
 ```
-where $s_i$ are generated token sequences, $\theta$ are the model weights, 
+where $s_i$ are generated tokens, $\theta$ are the model weights, 
 $Q$ and $\bar Q$ are cumulative 
-rewards-to-go for a generated sequences in sampling and argmax mode (as a stable 
-deterministic baseline).
+rewards-to-go (reverse cumsum of rewards) for generated sequences in 
+sampling and argmax mode (as a stable deterministic baseline).
 
-For the word generation reward of +1 is given for the current token $s_i$ if the 
+For the word generation a reward of +1 is given for the current token $s_i$ if the 
 prefix-so-far $s_1,...s_i$ is the prefix of some transitive verb 
-from the training set, reward -1 is given if the prefix is not represented by 
+from the training set, the reward -1 is given if the prefix is not represented by 
 any word at all. In all other cases the reward is 0. Also, a small reward of +0.5
-is added at the end token if a generated word is a full word presented in the dictionary.
+is added to the end token if a generated word is a full word presented in the 
+dictionary.
 
 Then we have two different setups for output diversity encouraging
 1. Entropy Penalty.  
-In this setup the additional entropy term $ - \beta H(p(.|s_{1..k-1}, \theta))$
+In this setup the additional entropy term $-\beta H(p(.|s_{1..k-1}, \theta))$
 is added to the loss
 2. Curiosity Reward.  
 In this setup additional curiosity reward is added to the word generation reward, 
 a number from the interval $[0, 1]$. If the sequence $s_1,...s_i$ (regardless of 
 the $s_1,...s_{i-1}$ status) is pretty new to the curiosity model, then it 
-should be surprised by it and give a reward close to 1 to the token %s_i%.
+should be surprised by it and give a reward close to 1 to the token $s_i$.
 Otherwise, if the sequence is generated too often then the curiosity model is 
 bored and gives a reward close to 0. 
 
 After the pretraining and rl-finetuning phases the model is evaluated
-on the amount of unseen words from the test set it can produce by sampling.
+by the amount of unseen words from the test set it can produce by sampling.
 Overall, both approaches show pretty much the same results of ~1500 out of 6000 
 unseen test words found from 200k samples.
 
