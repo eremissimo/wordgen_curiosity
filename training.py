@@ -133,15 +133,6 @@ def refine_predictions(*tensors):
     return tensors
 
 
-def ppo_step(model, reward, optimizer, batch_size: int, self_critic: bool=True, entr_penalty: float = 0.0):
-    """A single Proximity Policy Optimization step"""
-    pass
-
-
-def calculate_rl_metrics(seq, token_trie):
-    pass
-
-
 def count_generated_word_types(model, batch_size, n_batches, token_trie):
     model.eval()
     seq_list = []
@@ -172,12 +163,6 @@ def do_every_k_step(step: int, k: int, fun: Callable, *args, **kwargs):
         fun(*args, **kwargs)
 
 
-def eval_model(model, tokenizer, n_samples=50):
-    model.eval()
-    seq = model.generate_sample(n_samples)
-    eval_sequence(seq, tokenizer)
-
-
 def eval_sequence(seq: torch.Tensor, tokenizer, n: Optional[int] = None):
     seq = seq.cpu().tolist()
     if n is not None:
@@ -194,12 +179,9 @@ def extract_decoded(string):
     return string
 
 
-def write_to_summary(writer, metrics: dict, global_step: int):
-    for k, v in metrics.items():
-        writer.add_scalar(k, v.item(), global_step=global_step)
-
-
 def main(config: dict):
+    """The main training function. Pretrain on the set (Words \ Test_v.t._words),
+    then fine-tune on the set (Train_v.t._words)"""
     model, tokenizer, token_word_checker, str_word_checker = pretrain(config)
     # fine-tune only the last transformer layer and the model's 'head'
     model.freeze_n_layers(config["model_cfg"]["num_layers"] - 1)
@@ -207,6 +189,8 @@ def main(config: dict):
 
 
 def word_discovery(config: dict, batch_size: int, n_batches: int, use_checkpoint: Optional[str] = None):
+    """Sample the trained model loaded from the 'use_checkpoint' and discover unseen v.t. words
+    (i.e. words from the test set)"""
     config = deepcopy(config)
     config["pretrain_cfg"]["epochs"] = 0        # skip pretraining, only load data
     if use_checkpoint is not None:
